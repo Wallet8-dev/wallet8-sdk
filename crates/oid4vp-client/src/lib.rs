@@ -482,6 +482,13 @@ fn path_key(path: &[serde_json::Value]) -> String {
         .join("/")
 }
 
+/// The human-readable form of a claims path (the consent preview's
+/// display): the §7 pointer joined with `/` (the mdoc form is
+/// already `namespace/element`).
+pub fn claim_path_display(path: &[serde_json::Value]) -> String {
+    path_key(path)
+}
+
 // ── The VP Token assembly (OID4VP §8.1 + App. B) ────────────────────
 
 /// The audience for the Holder Binding proofs (§14.1.2 + App. A.4):

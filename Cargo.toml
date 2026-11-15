@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "facade",
+    "crates/oid4vci-client",
+    "crates/oid4vp-client",
+    "crates/holder-contracts",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Wallet8-dev/wallet8-sdk"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# The platform (sentin8::mdoc is the mdoc engine; the shell/auth/tls
+# surfaces ride the same facade) - pinned by tag like every vertical.
+sentin8 = { git = "https://github.com/Sentin8/sentin8-sdk", tag = "sdk-v1.1.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+reqwest = { version = "0.12", features = ["json", "rustls-tls-native-roots-no-provider"], default-features = false }
+base64 = "0.22"
+sha2 = "0.10"
+p256 = { version = "0.13", features = ["ecdsa", "ecdsa-core", "pem"] }
+tokio = { version = "1", features = ["full"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# The namespace facade - every consumer imports wallet8::{leaf}.
+wallet8-oid4vci-client = { path = "crates/oid4vci-client" }
+wallet8-oid4vp-client = { path = "crates/oid4vp-client" }
+wallet8-holder-contracts = { path = "crates/holder-contracts" }

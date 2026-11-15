@@ -1,46 +1,50 @@
-//! # wallet8-oid4vci-client - the OID4VCI wallet client
+//! # wallet8-oid4vci-client - the OID4VCI 1.0 wallet client
 //!
-//! The wallet-role credential issuance client (OID4VCI 1.0 Final): the
-//! reusable driver any vertical's wallet embeds. The flow surfaces:
+//! The wallet-role credential issuance client implementing
+//! **OpenID for Verifiable Credential Issuance 1.0** (Final, 16 Sep 2025)
+//! - every function cites its spec section. This is a spec
+//! implementation, not a test-shaped adapter: the OIDF conformance
+//! suite verifies the behavior, but the CONTRACT is the specification.
 //!
-//! 1. **Metadata resolution** - `GET /.well-known/openid-credential-issuer`
-//!    against the issuer host (`resolve_issuer_metadata`); the
-//!    credential-configuration catalog drives every later step.
-//! 2. **Offer intake** - the issuer-initiated credential offer (by
-//!    value: inline JSON; by reference: a `credential_offer_uri`
-//!    fetch) - `parse_credential_offer`.
-//! 3. **The authorization-code flow** - the wallet drives the OAuth
-//!    authorize round with the credential configuration's `scope`
-//!    (the PKCE pair minted here), exchanging the code at the token
-//!    endpoint (`authorize_for_credential`).
-//! 4. **Proof minting** - the `openid4vci-proof+jwt` JWS: `typ`
-//!    openid4vci-proof+jwt, ES256 over the wallet's P-256 device key,
-//!    the JWK in the header, `iss` = client_id, `aud` = the issuer,
-//!    `iat` + the `c_nonce` (the `/oauth/nonce` pre-flight, Final
-//!    §8.1) - `mint_jwt_proof`.
-//! 5. **Issuance** - `POST /oauth/credential` with the credential
-//!    request (the configuration id + the proofs); the `credentials`
-//!    array response parses to the wallet's credential store entries
-//!    (the `mso_mdoc` entries decode to the mdoc IssuerSigned; the
-//!    `dc+sd-jwt` entries stay compact) - `request_credential`.
-//! 6. **Batch + deferred** - N proofs mint N credentials (§7.3); a
-//!    `transaction_id` answer polls `/oauth/deferred_credential`
-//!    (§8.2) - `poll_deferred`.
+//! ## The flows (OID4VCI §3.3.3)
 //!
-//! The client is transport-thin: every call takes the issuer base URL
-//! and returns the parsed wire value - the host app owns the UI and
-//! the credential-store persistence (the wallet8-holder contracts).
+//! - **Authorization Code Flow** (§3.4): the wallet pushes the
+//!   authorization request (PAR recommended, §5.1.4) with either the
+//!   `authorization_details` parameter (type `openid_credential`,
+//!   §5.1.1) or the `scope` (§5.1.2), completes the browser round,
+//!   exchanges the code (§6.1), then requests the credential (§8.2).
+//! - **Pre-Authorized Code Flow** (§3.5): the offer carries the
+//!   `pre-authorized_code` (§4.1.1); the wallet exchanges it directly
+//!   at the token endpoint - no Authorization Endpoint round. The
+//!   optional `tx_code` (the offer declares its input_mode/length)
+//!   rides the exchange.
+//! - **Deferred issuance** (§9): a `transaction_id` + `interval`
+//!   answer polls the Deferred Credential Endpoint.
+//! - **Notification** (§11): the wallet reports `credential_accepted`
+//!   / `credential_failure` / `credential_deleted` per
+//!   `notification_id`.
+//!
+//! ## Offer intake (OID4VCI §4.1)
+//!
+//! The offer arrives by value (`credential_offer` query parameter,
+//! §4.1.2) or by reference (`credential_offer_uri`, §4.1.3), under the
+//! `openid-credential-offer://` custom scheme or an https URL. The
+//! wallet MUST NOT trust the offer's contents (§13.5) - the issuer
+//! metadata re-resolves and every later step validates against it.
 //!
 //! # Examples
 //!
-//! Mint a proof for a c_nonce:
+//! Mint a jwt proof (Appendix F.1):
 //!
 //! ```
 //! use wallet8_oid4vci_client::mint_jwt_proof;
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let key = p256::ecdsa::SigningKey::from(&p256::SecretKey::random(
 //!     &mut p256::elliptic_curve::rand_core::OsRng));
-//! let jwt = mint_jwt_proof(&key, "wallet-client-id", "https://issuer", Some("c-nonce"))?;
+//! // iss omitted: the anonymous pre-authorized form (Appendix F.1 -
+//! // iss MUST be omitted when the access token came from an
+//! // anonymous pre-authorized exchange).
+//! let jwt = mint_jwt_proof(&key, None, "https://issuer", Some("c-nonce"))?;
 //! assert!(jwt.split('.').count() == 3);
 //! # Ok(())
 //! # }
@@ -50,193 +54,11 @@ use base64::Engine;
 use p256::ecdsa::signature::Signer;
 use serde::{Deserialize, Serialize};
 
-/// The b64url encoder used across every wire member.
 fn b64u(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-/// The credential-issuer metadata (the `credential_configurations_supported`
-/// subset the wallet drives).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IssuerMetadata {
-    /// The `credential_issuer` member.
-    pub credential_issuer: String,
-    /// The `credential_endpoint`.
-    pub credential_endpoint: String,
-    /// The `nonce_endpoint` (Final §8.1) when present.
-    #[serde(default)]
-    pub nonce_endpoint: Option<String>,
-    /// The authorization server's endpoints (discovery-derived when
-    /// absent per Final §4.2).
-    #[serde(default)]
-    pub authorization_endpoint: Option<String>,
-    #[serde(default)]
-    pub token_endpoint: Option<String>,
-    /// The credential catalog: id -> configuration.
-    pub credential_configurations_supported:
-        std::collections::BTreeMap<String, serde_json::Value>,
-}
-
-/// One credential configuration's wire view.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CredentialConfiguration {
-    /// The `format` (`mso_mdoc` / `dc+sd-jwt`).
-    pub format: String,
-    /// The configuration's `scope` (the authorize round's scope).
-    #[serde(default)]
-    pub scope: Option<String>,
-    /// The mdoc `doctype` (the `mso_mdoc` configs).
-    #[serde(default)]
-    pub doctype: Option<String>,
-}
-
-/// The credential-offer wire form (by value or by reference).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CredentialOffer {
-    /// The offered configuration ids.
-    #[serde(default)]
-    pub credential_configuration_ids: Vec<String>,
-    /// The issuer (inherited from the landing when absent).
-    #[serde(default)]
-    pub credential_issuer: Option<String>,
-    /// The pre-authorized grant (the PIN flow) when present.
-    #[serde(default)]
-    pub grants: serde_json::Value,
-}
-
-/// A minted credential entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MintedCredential {
-    /// The `format` member (`mso_mdoc` / `dc+sd-jwt`).
-    pub format: String,
-    /// The credential string (the mdoc IssuerSigned base64url or the
-    /// compact sd-jwt).
-    pub credential: String,
-}
-
-/// Resolve the issuer metadata (GET the well-known).
-///
-/// # Errors
-/// Transport + parse failures with a descriptive message.
-pub async fn resolve_issuer_metadata(
-    http: &reqwest::Client,
-    issuer_base: &str,
-) -> Result<IssuerMetadata, String> {
-    let url = format!(
-        "{}/.well-known/openid-credential-issuer",
-        issuer_base.trim_end_matches('/')
-    );
-    let resp = http
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("issuer metadata fetch: {e}"))?;
-    let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| format!("issuer metadata read: {e}"))?;
-    if !status.is_success() {
-        return Err(format!("issuer metadata: HTTP {status}"));
-    }
-    serde_json::from_str(&body).map_err(|e| format!("issuer metadata parse: {e}"))
-}
-
-/// Parse a credential offer (the by-value JSON or the by-reference
-/// URI's fetched body - the caller fetches the URI).
-///
-/// # Errors
-/// A malformed offer.
-pub fn parse_credential_offer(body: &str) -> Result<CredentialOffer, String> {
-    let v: serde_json::Value =
-        serde_json::from_str(body).map_err(|e| format!("offer parse: {e}"))?;
-    // The by-value form nests under `credential_offer` when carried in
-    // the offer landing's query parameter.
-    let offer = if let Some(inner) = v.get("credential_offer") {
-        inner.clone()
-    } else {
-        v
-    };
-    serde_json::from_value(offer).map_err(|e| format!("offer shape: {e}"))
-}
-
-/// The JWK (JSON) form of the wallet's P-256 device key.
-pub fn device_key_jwk(key: &p256::ecdsa::VerifyingKey) -> serde_json::Value {
-    let point = key.to_encoded_point(false);
-    let bytes = point.as_bytes();
-    serde_json::json!({
-        "kty": "EC",
-        "crv": "P-256",
-        "x": b64u(&bytes[1..33]),
-        "y": b64u(&bytes[33..65]),
-    })
-}
-
-/// Mint the `openid4vci-proof+jwt` JWS (Final §7.2/§8): ES256 over the
-/// wallet's device key, the PUBLIC JWK in the header (the issuer's
-/// device-key-match check reads it), `iss` = client_id, `aud` = the
-/// issuer, `iat`, and the c_nonce when the nonce pre-flight issued one.
-///
-/// # Errors
-/// Signing failures (a descriptive string).
-pub fn mint_jwt_proof(
-    key: &p256::ecdsa::SigningKey,
-    client_id: &str,
-    issuer: &str,
-    c_nonce: Option<&str>,
-) -> Result<String, String> {
-    let jwk = device_key_jwk(&key.verifying_key());
-    let header = serde_json::json!({
-        "typ": "openid4vci-proof+jwt",
-        "alg": "ES256",
-        "jwk": jwk,
-    });
-    let now = chrono::Utc::now().timestamp();
-    let mut claims = serde_json::json!({
-        "iss": client_id,
-        "aud": issuer,
-        "iat": now,
-    });
-    if let Some(n) = c_nonce {
-        claims["nonce"] = serde_json::json!(n);
-    }
-    let header_b64 = b64u(serde_json::to_vec(&header).map_err(|e| e.to_string())?.as_slice());
-    let payload_b64 = b64u(serde_json::to_vec(&claims).map_err(|e| e.to_string())?.as_slice());
-    let signing_input = format!("{header_b64}.{payload_b64}");
-    let sig: p256::ecdsa::Signature = key.sign(signing_input.as_bytes());
-    Ok(format!("{signing_input}.{}", b64u(&sig.to_bytes())))
-}
-
-/// The authorization-round target for a configuration (the authorize
-/// URL + PKCE pair): the wallet opens this in the system browser.
-///
-/// # Errors
-/// None in practice (the Result keeps the signature stable).
-pub fn authorize_url(
-    issuer_base: &str,
-    authorization_endpoint: &str,
-    client_id: &str,
-    redirect_uri: &str,
-    scope: &str,
-) -> (String, String, String) {
-    // The PKCE pair: a fresh verifier + its S256 challenge.
-    let verifier = uuid::Uuid::new_v4().simple().to_string()
-        + &uuid::Uuid::new_v4().simple().to_string();
-    use sha2::Digest;
-    let challenge = b64u(&sha2::Sha256::digest(verifier.as_bytes()));
-    let state = uuid::Uuid::new_v4().simple().to_string();
-    let _ = issuer_base;
-    let url = format!(
-        "{authorization_endpoint}?response_type=code&client_id={client_id}\
-&redirect_uri={}&scope={}&state={state}&code_challenge={challenge}\
-&code_challenge_method=S256",
-        urlencode(redirect_uri),
-        urlencode(scope),
-    );
-    (url, state, verifier)
-}
-
-/// URL-encode a query member.
+/// URL-encode a query member (RFC 3986 unreserved kept).
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
     for byte in s.bytes() {
@@ -250,27 +72,751 @@ fn urlencode(s: &str) -> String {
     out
 }
 
-/// The credential request (Final §7.2): the configuration id + the
-/// proofs array.
-#[derive(Debug, Clone, Serialize)]
-pub struct CredentialRequestBody {
-    /// The `credential_configuration_id`.
-    pub credential_configuration_id: String,
-    /// The `proofs`: `{jwt: [<proof>...]}` (one per signing key; N
-    /// proofs mint N credentials - the batch form, Final §7.3).
-    pub proofs: serde_json::Value,
+// ── Credential Offer (OID4VCI §4.1.1) ───────────────────────────────
+
+/// The Transaction Code requirements (the offer's `tx_code` object,
+/// §4.1.1): present (even empty) = the End-User must provide one.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TxCode {
+    /// `input_mode`: `numeric` (default) | `text`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_mode: Option<String>,
+    /// `length`: the expected code length (UI hint).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length: Option<u32>,
+    /// `description` (<= 300 chars): how the Holder obtains the code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
-/// POST the credential request; parse the `credentials` array.
+/// One grant of the Credential Offer (the `grants` member, §4.1.1).
+#[derive(Debug, Clone)]
+pub enum OfferGrant {
+    /// The Authorization Code grant: `issuer_state` binds the
+    /// authorize round to the offer's context.
+    AuthorizationCode {
+        /// The offer's `issuer_state` (rides the authorize request,
+        /// §5.1.3).
+        issuer_state: Option<String>,
+        /// The `authorization_server` hint (§4.1.1) - selects one of
+        /// the metadata's `authorization_servers`.
+        authorization_server: Option<String>,
+    },
+    /// The Pre-Authorized Code grant (§3.5): the offer carries the
+    /// code; the wallet exchanges it directly (§6.1).
+    PreAuthorizedCode {
+        /// The `pre-authorized_code` (REQUIRED, short-lived, single
+        /// use).
+        pre_authorized_code: String,
+        /// The `tx_code` requirements when the issuer demands one.
+        tx_code: Option<TxCode>,
+        /// The `authorization_server` hint.
+        authorization_server: Option<String>,
+    },
+}
+
+/// The Credential Offer object (OID4VCI §4.1.1).
+#[derive(Debug, Clone)]
+pub struct CredentialOffer {
+    /// `credential_issuer` (REQUIRED): the issuer identifier - the
+    /// wallet resolves its metadata (§12.2.2).
+    pub credential_issuer: String,
+    /// `credential_configuration_ids` (REQUIRED, non-empty, unique):
+    /// keys into the issuer's `credential_configurations_supported`.
+    pub credential_configuration_ids: Vec<String>,
+    /// The offered grants (§4.1.1). Empty = the wallet determines the
+    /// grant types from the metadata.
+    pub grants: Vec<OfferGrant>,
+}
+
+/// The offer-intake source (§4.1.2/§4.1.3): the scanned URL carries
+/// the offer by value or by reference.
+#[derive(Debug, Clone)]
+pub enum OfferIntake {
+    /// The `credential_offer` query parameter (URL-encoded JSON).
+    ByValue(String),
+    /// The `credential_offer_uri` query parameter - fetch to obtain
+    /// the offer object (`application/json`, §4.1.3).
+    ByReference(String),
+}
+
+/// Parse the scanned offer URL into the intake form (§4.1.2/§4.1.3).
+/// Accepts the `openid-credential-offer://` custom scheme and plain
+/// https URLs; exactly one of `credential_offer` /
+/// `credential_offer_uri` rides the query.
 ///
 /// # Errors
-/// Transport + the issuer's error envelope (a descriptive string).
+/// A descriptive string for a malformed intake URL.
+pub fn parse_offer_url(url: &str) -> Result<OfferIntake, String> {
+    // Strip the custom scheme to a query string; https URLs parse the
+    // same way (the query is what matters).
+    let query = match url.split_once('?') {
+        Some((_, q)) => q,
+        None => return Err("the offer URL carries no query parameters".into()),
+    };
+    let mut by_value: Option<String> = None;
+    let mut by_reference: Option<String> = None;
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=').ok_or("a malformed query pair")?;
+        let decoded = percent_decode(v);
+        match k {
+            "credential_offer" => by_value = Some(decoded),
+            "credential_offer_uri" => by_reference = Some(decoded),
+            _ => {}
+        }
+    }
+    match (by_value, by_reference) {
+        (Some(v), None) => Ok(OfferIntake::ByValue(v)),
+        (None, Some(r)) => Ok(OfferIntake::ByReference(r)),
+        (Some(_), Some(_)) => Err(
+            "credential_offer and credential_offer_uri are mutually exclusive (§4.1)".into(),
+        ),
+        (None, None) => Err("the offer carries neither parameter (§4.1)".into()),
+    }
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        if bytes[i] == b'+' {
+            out.push(b' ');
+        } else {
+            out.push(bytes[i]);
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parse the Credential Offer object JSON (§4.1.1).
+///
+/// # Errors
+/// A descriptive string for a non-conformant offer: a missing
+/// `credential_issuer`, an empty/duplicated
+/// `credential_configuration_ids`, or a malformed `grants` entry.
+pub fn parse_credential_offer(body: &str) -> Result<CredentialOffer, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("offer parse: {e}"))?;
+    let credential_issuer = v
+        .get("credential_issuer")
+        .and_then(|c| c.as_str())
+        .ok_or("the offer carries no credential_issuer (§4.1.1 REQUIRED)")?
+        .to_string();
+    let ids: Vec<String> = v
+        .get("credential_configuration_ids")
+        .and_then(|c| c.as_array())
+        .ok_or("the offer carries no credential_configuration_ids (§4.1.1 REQUIRED)")?
+        .iter()
+        .filter_map(|id| id.as_str().map(str::to_string))
+        .collect();
+    if ids.is_empty() {
+        return Err("credential_configuration_ids is empty (§4.1.1 non-empty)".into());
+    }
+    if ids.len() != ids.iter().collect::<std::collections::HashSet<_>>().len() {
+        return Err("credential_configuration_ids carries duplicates (§4.1.1 unique)".into());
+    }
+    let mut grants = Vec::new();
+    if let Some(grants_obj) = v.get("grants").and_then(|g| g.as_object()) {
+        for (name, value) in grants_obj {
+            match name.as_str() {
+                "authorization_code" => grants.push(OfferGrant::AuthorizationCode {
+                    issuer_state: value
+                        .get("issuer_state")
+                        .and_then(|s| s.as_str())
+                        .map(str::to_string),
+                    authorization_server: value
+                        .get("authorization_server")
+                        .and_then(|s| s.as_str())
+                        .map(str::to_string),
+                }),
+                "urn:ietf:params:oauth:grant-type:pre-authorized_code" => {
+                    grants.push(OfferGrant::PreAuthorizedCode {
+                        pre_authorized_code: value
+                            .get("pre-authorized_code")
+                            .and_then(|c| c.as_str())
+                            .ok_or("the pre-authorized grant carries no pre-authorized_code (§4.1.1 REQUIRED)")?
+                            .to_string(),
+                        tx_code: value.get("tx_code").map(|t| TxCode {
+                            input_mode: t.get("input_mode").and_then(|m| m.as_str()).map(str::to_string),
+                            length: t.get("length").and_then(|l| l.as_u64()).map(|l| l as u32),
+                            description: t.get("description").and_then(|d| d.as_str()).map(str::to_string),
+                        }),
+                        authorization_server: value
+                            .get("authorization_server")
+                            .and_then(|s| s.as_str())
+                            .map(str::to_string),
+                    })
+                }
+                // When multiple grants are present, the wallet chooses
+                // (§4.1.1); unknown grant types are ignored.
+                _ => {}
+            }
+        }
+    }
+    Ok(CredentialOffer {
+        credential_issuer,
+        credential_configuration_ids: ids,
+        grants,
+    })
+}
+
+// ── Credential Issuer Metadata (OID4VCI §12.2) ─────────────────────
+
+/// The Credential Issuer metadata (§12.2.4) - the members the wallet
+/// drives; unknown members are ignored (§12.2.4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssuerMetadata {
+    /// `credential_issuer` (REQUIRED, §12.2.4) - MUST equal the
+    /// identifier the metadata was fetched from (§12.2.2).
+    pub credential_issuer: String,
+    /// `authorization_servers` (OPTIONAL): the AS identifiers; absent
+    /// = the issuer acts as its own AS (§12.2.4).
+    #[serde(default)]
+    pub authorization_servers: Vec<String>,
+    /// `credential_endpoint` (REQUIRED).
+    pub credential_endpoint: String,
+    /// `nonce_endpoint` (OPTIONAL): present = proofs MUST carry the
+    /// `c_nonce` (§8.2, App. F.1).
+    #[serde(default)]
+    pub nonce_endpoint: Option<String>,
+    /// `deferred_credential_endpoint` (OPTIONAL, §9).
+    #[serde(default)]
+    pub deferred_credential_endpoint: Option<String>,
+    /// `notification_endpoint` (OPTIONAL, §11).
+    #[serde(default)]
+    pub notification_endpoint: Option<String>,
+    /// `batch_credential_issuance` (OPTIONAL): `batch_size` >= 2.
+    #[serde(default)]
+    pub batch_credential_issuance: Option<serde_json::Value>,
+    /// `display` (OPTIONAL): the issuer's display properties.
+    #[serde(default)]
+    pub display: Vec<serde_json::Value>,
+    /// `credential_configurations_supported` (REQUIRED): id ->
+    /// configuration (§12.2.4; the format profiles ride the entries,
+    /// App. A).
+    pub credential_configurations_supported:
+        std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// The RFC 8414 Authorization Server metadata (§12.2.4): the AS
+/// endpoints resolve from the `oauth-authorization-server`
+/// well-known of the AS identifier - never guessed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AsMetadata {
+    /// `authorization_endpoint` (RFC 8414).
+    pub authorization_endpoint: String,
+    /// `token_endpoint` (RFC 8414).
+    pub token_endpoint: String,
+    /// `pushed_authorization_request_endpoint` (RFC 9126).
+    #[serde(default)]
+    pub pushed_authorization_request_endpoint: Option<String>,
+    /// `pre-authorized_grant_anonymous_access_supported` (§12.3):
+    /// true = the pre-authorized token request carries NO client_id.
+    #[serde(default)]
+    pub pre_authorized_grant_anonymous_access_supported: bool,
+}
+
+/// Resolve the Credential Issuer metadata (§12.2.2): GET
+/// `{issuer}/.well-known/openid-credential-issuer`, then verify the
+/// returned `credential_issuer` equals the identifier the metadata
+/// was fetched from (a mismatch MUST NOT be used, §12.2.4).
+///
+/// # Errors
+/// Transport + parse failures, or the identity mismatch.
+pub async fn resolve_issuer_metadata(
+    http: &reqwest::Client,
+    issuer_identifier: &str,
+) -> Result<IssuerMetadata, String> {
+    let base = issuer_identifier.trim_end_matches('/');
+    let url = format!("{base}/.well-known/openid-credential-issuer");
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("issuer metadata fetch: {e}"))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("issuer metadata read: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("issuer metadata: HTTP {status}"));
+    }
+    let metadata: IssuerMetadata =
+        serde_json::from_str(&body).map_err(|e| format!("issuer metadata parse: {e}"))?;
+    if metadata.credential_issuer != issuer_identifier {
+        return Err(format!(
+            "the metadata credential_issuer {} does not match the requested identifier {} (§12.2.2)",
+            metadata.credential_issuer, issuer_identifier
+        ));
+    }
+    Ok(metadata)
+}
+
+/// Resolve the Authorization Server metadata (§12.2.4 + RFC 8414):
+/// GET `{as}/.well-known/oauth-authorization-server`.
+///
+/// # Errors
+/// Transport + parse failures.
+pub async fn resolve_as_metadata(
+    http: &reqwest::Client,
+    as_identifier: &str,
+) -> Result<AsMetadata, String> {
+    let base = as_identifier.trim_end_matches('/');
+    let url = format!("{base}/.well-known/oauth-authorization-server");
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("as metadata fetch: {e}"))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("as metadata read: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("as metadata: HTTP {status}"));
+    }
+    serde_json::from_str(&body).map_err(|e| format!("as metadata parse: {e}"))
+}
+
+/// The AS identifier for an issuance (§12.2.4): the offer's
+/// `authorization_server` hint when the metadata lists multiple, else
+/// the first entry, else the issuer itself.
+///
+/// # Errors
+/// A hint that matches no `authorization_servers` entry aborts the
+/// flow (§12.2.4 MUST NOT proceed).
+pub fn select_authorization_server(
+    metadata: &IssuerMetadata,
+    hint: Option<&str>,
+) -> Result<String, String> {
+    match (metadata.authorization_servers.as_slice(), hint) {
+        ([], _) => Ok(metadata.credential_issuer.clone()),
+        ([first], None) => Ok(first.clone()),
+        ([only], Some(h)) if h == only => Ok(only.clone()),
+        (many, Some(h)) => {
+            if many.iter().any(|m| m == h) {
+                Ok(h.to_string())
+            } else {
+                Err(format!(
+                    "the offer's authorization_server {h} matches no authorization_servers entry (§12.2.4)"
+                ))
+            }
+        }
+        (many, None) => Ok(many
+            .first()
+            .cloned()
+            .ok_or("the authorization_servers list is empty")?),
+    }
+}
+
+// ── The Authorization Code Flow (OID4VCI §5-§6) ────────────────────
+
+/// The PKCE pair (RFC 7636).
+pub struct PkcePair {
+    /// The verifier.
+    pub verifier: String,
+    /// The S256 challenge.
+    pub challenge: String,
+}
+
+/// Mint a PKCE pair (RFC 7636 §4.2: 43-128 chars, S256).
+pub fn pkce_pair() -> PkcePair {
+    use sha2::Digest;
+    let verifier = uuid::Uuid::new_v4().simple().to_string()
+        + &uuid::Uuid::new_v4().simple().to_string();
+    let challenge = b64u(&sha2::Sha256::digest(verifier.as_bytes()));
+    PkcePair { verifier, challenge }
+}
+
+/// The `authorization_details` of type `openid_credential` (§5.1.1):
+/// `type` + `credential_configuration_id` (+ optional `claims`
+/// descriptions + `locations` when the metadata lists multiple
+/// `authorization_servers`).
+pub fn authorization_details(
+    configuration_id: &str,
+    locations: Option<&str>,
+    claims: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut entry = serde_json::json!({
+        "type": "openid_credential",
+        "credential_configuration_id": configuration_id,
+    });
+    if let Some(loc) = locations {
+        entry["locations"] = serde_json::json!([loc]);
+    }
+    if let Some(c) = claims {
+        entry["claims"] = c.clone();
+    }
+    serde_json::json!([entry])
+}
+
+/// The PAR push (RFC 9126, recommended by §5.1.4): the authorization
+/// request parameters ride the push; the browser round carries only
+/// `client_id` + `request_uri`.
+///
+/// The offered grant's `issuer_state` (§5.1.3) rides the push when
+/// present.
+///
+/// Returns `(request_uri, state, pkce)`.
+///
+/// # Errors
+/// Transport + the PAR error envelope.
+pub async fn push_authorization_request(
+    http: &reqwest::Client,
+    par_endpoint: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    details: &serde_json::Value,
+    issuer_state: Option<&str>,
+) -> Result<(String, String, PkcePair), String> {
+    let pkce = pkce_pair();
+    let state = uuid::Uuid::new_v4().simple().to_string();
+    let mut form: Vec<(&str, String)> = vec![
+        ("response_type", "code".to_string()),
+        ("client_id", client_id.to_string()),
+        ("redirect_uri", redirect_uri.to_string()),
+        ("state", state.clone()),
+        ("code_challenge", pkce.challenge.clone()),
+        ("code_challenge_method", "S256".to_string()),
+        (
+            "authorization_details",
+            serde_json::to_string(details).map_err(|e| e.to_string())?,
+        ),
+    ];
+    if let Some(iss_state) = issuer_state {
+        form.push(("issuer_state", iss_state.to_string()));
+    }
+    let resp = http
+        .post(par_endpoint)
+        .form(&form)
+        .send()
+        .await
+        .map_err(|e| format!("par push: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| format!("par read: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("par push: HTTP {status}: {text}"));
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("par parse: {e}"))?;
+    let request_uri = v
+        .get("request_uri")
+        .and_then(|r| r.as_str())
+        .ok_or("the PAR response carries no request_uri (RFC 9126 §2.2)")?
+        .to_string();
+    Ok((request_uri, state, pkce))
+}
+
+/// The authorize URL after a PAR push (RFC 9126 §5).
+pub fn par_authorize_url(
+    authorization_endpoint: &str,
+    client_id: &str,
+    request_uri: &str,
+) -> String {
+    format!(
+        "{authorization_endpoint}?client_id={}&request_uri={}",
+        urlencode(client_id),
+        urlencode(request_uri),
+    )
+}
+
+/// The Token Request (authorization_code grant, §6.1): the code + the
+/// PKCE verifier + the redirect_uri.
+///
+/// # Errors
+/// Transport + the token error envelope (§6.3).
+pub async fn exchange_code(
+    http: &reqwest::Client,
+    token_endpoint: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    code: &str,
+    verifier: &str,
+) -> Result<serde_json::Value, String> {
+    let resp = http
+        .post(token_endpoint)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", client_id),
+            ("redirect_uri", redirect_uri),
+            ("code", code),
+            ("code_verifier", verifier),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("token exchange: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| format!("token read: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("token exchange: HTTP {status}: {text}"));
+    }
+    serde_json::from_str(&text).map_err(|e| format!("token parse: {e}"))
+}
+
+/// The Pre-Authorized Code exchange (§6.1): the grant type
+/// `urn:ietf:params:oauth:grant-type:pre-authorized_code` + the offer's
+/// code + the `tx_code` when the offer demanded one (§4.1.1: a
+/// present `tx_code` object - even empty - makes the token request's
+/// `tx_code` REQUIRED).
+///
+/// The `client_id` rides the request unless the AS advertises
+/// `pre-authorized_grant_anonymous_access_supported` (§12.3) - the
+/// anonymous form then MUST omit it (and the proof's `iss` too,
+/// App. F.1).
+///
+/// # Errors
+/// Transport + the token error envelope (§6.3: `invalid_request` for
+/// a missing/unexpected tx_code, `invalid_grant` for a wrong/expired
+/// code).
+pub async fn exchange_pre_authorized(
+    http: &reqwest::Client,
+    token_endpoint: &str,
+    client_id: Option<&str>,
+    pre_authorized_code: &str,
+    tx_code: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let mut form: Vec<(&str, String)> = vec![(
+        "grant_type",
+        "urn:ietf:params:oauth:grant-type:pre-authorized_code".to_string(),
+    )];
+    if let Some(cid) = client_id {
+        form.push(("client_id", cid.to_string()));
+    }
+    form.push(("pre-authorized_code", pre_authorized_code.to_string()));
+    if let Some(tx) = tx_code {
+        form.push(("tx_code", tx.to_string()));
+    }
+    let resp = http
+        .post(token_endpoint)
+        .form(&form)
+        .send()
+        .await
+        .map_err(|e| format!("pre-authorized exchange: {e}"))?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("pre-authorized read: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("pre-authorized exchange: HTTP {status}: {text}"));
+    }
+    serde_json::from_str(&text).map_err(|e| format!("token parse: {e}"))
+}
+
+/// The `credential_identifiers` of a Token Response (§6.2): the
+/// `authorization_details` entries of type `openid_credential` carry
+/// the identifiers the Credential Request then uses.
+///
+/// Returns None when the token response carries no
+/// `authorization_details` (the credential request then uses the
+/// `credential_configuration_id`, §8.2).
+pub fn credential_identifiers(token_response: &serde_json::Value) -> Option<Vec<String>> {
+    token_response
+        .get("authorization_details")
+        .and_then(|d| d.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("openid_credential"))
+                .filter_map(|e| e.get("credential_identifiers"))
+                .flat_map(|ids| ids.as_array().cloned().unwrap_or_default())
+                .filter_map(|id| id.as_str().map(str::to_string))
+                .collect()
+        })
+}
+
+// ── The Nonce Endpoint (OID4VCI §7) ────────────────────────────────
+
+/// Fetch a fresh `c_nonce` (§7.1: an unprotected POST). Present
+/// `nonce_endpoint` in the metadata = the proof MUST carry it
+/// (§8.2/App. F.1).
+///
+/// # Errors
+/// Transport + parse failures.
+pub async fn fetch_nonce(http: &reqwest::Client, nonce_endpoint: &str) -> Result<String, String> {
+    let resp = http
+        .post(nonce_endpoint)
+        .send()
+        .await
+        .map_err(|e| format!("nonce fetch: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| format!("nonce read: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("nonce fetch: HTTP {status}"));
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("nonce parse: {e}"))?;
+    v.get("c_nonce")
+        .and_then(|n| n.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| "the nonce response carries no c_nonce (§7.2)".to_string())
+}
+
+// ── Proofs (OID4VCI §8.2 + Appendix F) ─────────────────────────────
+
+/// The JWK form of the wallet's P-256 key (RFC 7517).
+pub fn device_key_jwk(key: &p256::ecdsa::VerifyingKey) -> serde_json::Value {
+    let point = key.to_encoded_point(false);
+    let bytes = point.as_bytes();
+    serde_json::json!({
+        "kty": "EC",
+        "crv": "P-256",
+        "x": b64u(&bytes[1..33]),
+        "y": b64u(&bytes[33..65]),
+    })
+}
+
+/// Mint the `openid4vci-proof+jwt` (Appendix F.1): `typ`
+/// openid4vci-proof+jwt, an asymmetric `alg` (never none), the key in
+/// exactly ONE of `kid`/`jwk`/`x5c` (the jwk form here), optional
+/// `key_attestation` in the header (App. D). Claims: `iss` =
+/// client_id (OPTIONAL - MUST be omitted for the anonymous
+/// pre-authorized form), `aud` = the Credential Issuer Identifier
+/// (REQUIRED), `iat` (REQUIRED), `nonce` = the c_nonce (REQUIRED when
+/// the issuer has a Nonce Endpoint, §8.2).
+///
+/// # Errors
+/// Signing failures.
+pub fn mint_jwt_proof(
+    key: &p256::ecdsa::SigningKey,
+    client_id: Option<&str>,
+    issuer_identifier: &str,
+    c_nonce: Option<&str>,
+) -> Result<String, String> {
+    let header = serde_json::json!({
+        "typ": "openid4vci-proof+jwt",
+        "alg": "ES256",
+        "jwk": device_key_jwk(&key.verifying_key()),
+    });
+    let now = chrono::Utc::now().timestamp();
+    let mut claims = serde_json::json!({
+        "aud": issuer_identifier,
+        "iat": now,
+    });
+    if let Some(cid) = client_id {
+        claims["iss"] = serde_json::json!(cid);
+    }
+    if let Some(n) = c_nonce {
+        claims["nonce"] = serde_json::json!(n);
+    }
+    let header_b64 = b64u(serde_json::to_vec(&header).map_err(|e| e.to_string())?.as_slice());
+    let payload_b64 = b64u(serde_json::to_vec(&claims).map_err(|e| e.to_string())?.as_slice());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let sig: p256::ecdsa::Signature = key.sign(signing_input.as_bytes());
+    Ok(format!("{signing_input}.{}", b64u(&sig.to_bytes())))
+}
+
+// ── The Credential Endpoint (OID4VCI §8) ───────────────────────────
+
+/// The Credential Request's identifier member (§8.2): exactly one of
+/// `credential_identifier` (when the token response returned
+/// `authorization_details.credential_identifiers`) or
+/// `credential_configuration_id` (otherwise).
+#[derive(Debug, Clone)]
+pub enum CredentialRequestTarget {
+    /// The `credential_identifier` from the token response
+    /// (§6.2/§3.3.4).
+    Identifier(String),
+    /// The `credential_configuration_id`.
+    ConfigurationId(String),
+}
+
+impl CredentialRequestTarget {
+    /// The serde view of the identifier member.
+    fn body_member(&self) -> serde_json::Value {
+        match self {
+            Self::Identifier(id) => serde_json::json!({ "credential_identifier": id }),
+            Self::ConfigurationId(id) => {
+                serde_json::json!({ "credential_configuration_id": id })
+            }
+        }
+    }
+}
+
+/// The Credential Request body (§8.2): exactly one identifier member
+/// + the `proofs` object keyed by proof type (+ the optional
+/// `credential_response_encryption` members).
+#[derive(Debug, Clone)]
+pub struct CredentialRequestBody {
+    /// The identifier member (§8.2).
+    pub target: CredentialRequestTarget,
+    /// The `proofs` object: `{jwt: [proof...]}` (App. F.1) - REQUIRED
+    /// when the configuration's `proof_types_supported` is present
+    /// (§8.2); N proofs mint N credentials (the batch, §3.3.2).
+    pub proofs: serde_json::Value,
+    /// The optional `credential_response_encryption` (§8.2:
+    /// `{jwk, enc, zip?}`).
+    pub credential_response_encryption: Option<serde_json::Value>,
+}
+
+impl serde::Serialize for CredentialRequestBody {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+        let mut map = serde_json::Map::new();
+        for (k, v) in self.target.body_member().as_object().cloned().unwrap_or_default() {
+            map.insert(k, v);
+        }
+        map.insert("proofs".into(), self.proofs.clone());
+        if let Some(enc) = &self.credential_response_encryption {
+            map.insert("credential_response_encryption".into(), enc.clone());
+        }
+        serde_json::Value::Object(map).serialize(s)
+    }
+}
+
+/// A minted credential entry (§8.3 + App. A: the mdoc credential is
+/// the base64url IssuerSigned CBOR (A.2.4); the dc+sd-jwt credential
+/// is the compact SD-JWT string (A.3.4); the jwt_vc_json credential
+/// is the JWT string (A.1.1.4)).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MintedCredential {
+    /// The credential string.
+    pub credential: String,
+}
+
+/// The Credential Response (§8.3): the immediate form (`credentials`)
+/// or the deferred form (`transaction_id` + `interval`).
+#[derive(Debug, Clone)]
+pub enum CredentialResponse {
+    /// The 200 immediate form: the `credentials` array.
+    Issued(Vec<MintedCredential>),
+    /// The 202 deferred form (§9): poll after `interval` seconds.
+    Deferred {
+        /// The transaction id.
+        transaction_id: String,
+        /// The minimum poll interval (seconds).
+        interval: u64,
+        /// The `notification_id` when the issuer uses notifications.
+        notification_id: Option<String>,
+    },
+}
+
+/// POST the Credential Request (§8.2) and parse the response per
+/// §8.3: 200 = the credentials array; 202 = the deferred
+/// transaction.
+///
+/// # Errors
+/// Transport + the Credential Error Response (§8.3.1.2:
+/// `invalid_credential_request`, `unknown_credential_configuration`,
+/// `unknown_credential_identifier`, `invalid_proof`, `invalid_nonce`,
+/// `invalid_encryption_parameters`, `credential_request_denied`).
 pub async fn request_credential(
     http: &reqwest::Client,
     credential_endpoint: &str,
     access_token: &str,
     body: &CredentialRequestBody,
-) -> Result<Vec<MintedCredential>, String> {
+) -> Result<CredentialResponse, String> {
     let resp = http
         .post(credential_endpoint)
         .bearer_auth(access_token)
@@ -288,44 +834,57 @@ pub async fn request_credential(
     }
     let v: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("credential response parse: {e}"))?;
-    // The immediate form: the credentials array; the deferred form: a
-    // transaction_id (the caller polls).
-    let creds = v
-        .get("credentials")
-        .and_then(|c| c.as_array())
-        .ok_or_else(|| {
-            format!("the response carries no credentials array: {text}")
-        })?;
-    let mut out = Vec::new();
-    for entry in creds {
-        let format = entry
-            .get("format")
-            .and_then(|f| f.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let credential = entry
-            .get("credential")
-            .and_then(|c| c.as_str())
-            .ok_or("a credentials entry carries no credential string")?
-            .to_string();
-        out.push(MintedCredential { format, credential });
+    if let Some(creds) = v.get("credentials").and_then(|c| c.as_array()) {
+        let mut out = Vec::new();
+        for entry in creds {
+            out.push(MintedCredential {
+                credential: entry
+                    .get("credential")
+                    .and_then(|c| c.as_str())
+                    .ok_or("a credentials entry carries no credential (§8.3)")?
+                    .to_string(),
+            });
+        }
+        return Ok(CredentialResponse::Issued(out));
     }
-    Ok(out)
+    if let Some(tx) = v.get("transaction_id").and_then(|t| t.as_str()) {
+        let interval = v.get("interval").and_then(|i| i.as_u64()).unwrap_or(0);
+        return Ok(CredentialResponse::Deferred {
+            transaction_id: tx.to_string(),
+            interval,
+            notification_id: v
+                .get("notification_id")
+                .and_then(|n| n.as_str())
+                .map(str::to_string),
+        });
+    }
+    Err("the response carries neither credentials nor transaction_id (§8.3)".into())
 }
 
-/// The deferred-issuance answer: the credentials or a pending marker.
+// ── The Deferred Credential Endpoint (OID4VCI §9) ───────────────────
+
+/// The Deferred Credential answer (§9.2): the issued credentials or
+/// the still-pending marker.
 #[derive(Debug, Clone)]
 pub enum DeferredAnswer {
-    /// The issuance completed.
+    /// The 200 form: the credentials landed.
     Issued(Vec<MintedCredential>),
-    /// Still pending - poll again after `interval` seconds.
-    Pending { transaction_id: String },
+    /// The 202 form: poll again after `interval` seconds with the
+    /// SAME transaction_id.
+    Pending {
+        /// The transaction id.
+        transaction_id: String,
+        /// The interval (seconds).
+        interval: u64,
+    },
 }
 
-/// Poll a deferred transaction (Final §8.2).
+/// Poll the Deferred Credential Endpoint (§9.1): the transaction_id +
+/// the same access token.
 ///
 /// # Errors
-/// Transport + parse failures.
+/// Transport + the error envelope (§9.3: `invalid_transaction_id`,
+/// `credential_request_denied` - the latter is terminal).
 pub async fn poll_deferred(
     http: &reqwest::Client,
     deferred_endpoint: &str,
@@ -344,27 +903,15 @@ pub async fn poll_deferred(
         .text()
         .await
         .map_err(|e| format!("deferred response read: {e}"))?;
-    if status.as_u16() == 400 {
-        // The pending form answers the error envelope
-        // {error: issuance_pending}.
-        if text.contains("issuance_pending") {
-            return Ok(DeferredAnswer::Pending {
-                transaction_id: transaction_id.to_string(),
-            });
-        }
-        return Err(format!("deferred poll: HTTP 400: {text}"));
+    if !status.is_success() {
+        return Err(format!("deferred poll: HTTP {status}: {text}"));
     }
     let v: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("deferred parse: {e}"))?;
-    if let Some(creds) = v.get("credentials") {
+    if let Some(creds) = v.get("credentials").and_then(|c| c.as_array()) {
         let mut out = Vec::new();
-        for entry in creds.as_array().unwrap_or(&vec![]) {
+        for entry in creds {
             out.push(MintedCredential {
-                format: entry
-                    .get("format")
-                    .and_then(|f| f.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
                 credential: entry
                     .get("credential")
                     .and_then(|c| c.as_str())
@@ -374,7 +921,75 @@ pub async fn poll_deferred(
         }
         return Ok(DeferredAnswer::Issued(out));
     }
-    Err(format!("deferred answer carries no credentials: {text}"))
+    if let Some(tx) = v.get("transaction_id").and_then(|t| t.as_str()) {
+        let interval = v.get("interval").and_then(|i| i.as_u64()).unwrap_or(0);
+        return Ok(DeferredAnswer::Pending {
+            transaction_id: tx.to_string(),
+            interval,
+        });
+    }
+    Err("the deferred response carries neither credentials nor transaction_id (§9.2)".into())
+}
+
+// ── The Notification Endpoint (OID4VCI §11) ─────────────────────────
+
+/// The notification events (§11.1).
+#[derive(Debug, Clone, Copy)]
+pub enum NotificationEvent {
+    /// The credentials were stored in the wallet.
+    CredentialAccepted,
+    /// The issuance failed (non-user-action causes).
+    CredentialFailure,
+    /// The user deleted the credential / rejected the issuance.
+    CredentialDeleted,
+}
+
+impl NotificationEvent {
+    /// The wire value.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::CredentialAccepted => "credential_accepted",
+            Self::CredentialFailure => "credential_failure",
+            Self::CredentialDeleted => "credential_deleted",
+        }
+    }
+}
+
+/// Send the issuance notification (§11.1): the `notification_id` from
+/// the Credential Response + the event. The issuer treats
+/// notifications as idempotent (§11).
+///
+/// # Errors
+/// Transport + the error envelope (§11.3:
+/// `invalid_notification_id`, `invalid_notification_request`).
+pub async fn send_notification(
+    http: &reqwest::Client,
+    notification_endpoint: &str,
+    access_token: &str,
+    notification_id: &str,
+    event: NotificationEvent,
+    description: Option<&str>,
+) -> Result<(), String> {
+    let mut body = serde_json::json!({
+        "notification_id": notification_id,
+        "event": event.code(),
+    });
+    if let Some(d) = description {
+        body["event_description"] = serde_json::json!(d);
+    }
+    let resp = http
+        .post(notification_endpoint)
+        .bearer_auth(access_token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("notification: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("notification: HTTP {status}: {text}"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -382,47 +997,132 @@ mod tests {
     use super::*;
 
     #[test]
-    fn proof_shape() {
+    fn proof_shape_and_iss_policy() {
         let key = p256::ecdsa::SigningKey::from(&p256::SecretKey::random(
             &mut p256::elliptic_curve::rand_core::OsRng,
         ));
-        let jwt = mint_jwt_proof(&key, "cid", "https://issuer", Some("n0")).unwrap();
-        let parts: Vec<&str> = jwt.split('.').collect();
-        assert_eq!(parts.len(), 3);
-        let header: serde_json::Value = serde_json::from_slice(
+        // The anonymous form: no iss (App. F.1).
+        let anon = mint_jwt_proof(&key, None, "https://issuer", Some("n0")).unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(
             &base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(parts[0])
+                .decode(anon.split('.').nth(1).unwrap())
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(header["typ"], "openid4vci-proof+jwt");
-        assert!(header["jwk"]["x"].is_string());
+        assert!(claims.get("iss").is_none());
+        assert_eq!(claims["aud"], "https://issuer");
+        assert_eq!(claims["nonce"], "n0");
+        // The authenticated form: iss = client_id.
+        let auth = mint_jwt_proof(&key, Some("cid"), "https://issuer", None).unwrap();
+        let claims2: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(auth.split('.').nth(1).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claims2["iss"], "cid");
     }
 
     #[test]
-    fn offer_parses_both_forms() {
-        let by_value = parse_credential_offer(
-            r#"{"credential_configuration_ids":["eu.europa.ec.eudi.pid.mdoc.1"],"credential_issuer":"https://i"}"#,
+    fn offer_intake_forms() {
+        let by_value = parse_offer_url(
+            "openid-credential-offer://?credential_offer=%7B%22credential_issuer%22%3A%22https%3A%2F%2Fi%22%2C%22credential_configuration_ids%22%3A%5B%22a%22%5D%7D",
         )
         .unwrap();
-        assert_eq!(by_value.credential_configuration_ids.len(), 1);
-        let nested = parse_credential_offer(
-            r#"{"credential_offer":{"credential_configuration_ids":["a","b"]}}"#,
+        let OfferIntake::ByValue(json) = by_value else { panic!("by value") };
+        let offer = parse_credential_offer(&json).unwrap();
+        assert_eq!(offer.credential_issuer, "https://i");
+        assert_eq!(offer.credential_configuration_ids, vec!["a"]);
+        let by_ref = parse_offer_url(
+            "openid-credential-offer://?credential_offer_uri=https%3A%2F%2Fi%2Foffer%2Fabc",
         )
         .unwrap();
-        assert_eq!(nested.credential_configuration_ids.len(), 2);
+        assert!(matches!(by_ref, OfferIntake::ByReference(uri) if uri == "https://i/offer/abc"));
+        // Both parameters = a spec violation (§4.1).
+        assert!(parse_offer_url("x?credential_offer=%7B%7D&credential_offer_uri=https%3A%2F%2Fi").is_err());
     }
 
     #[test]
-    fn authorize_url_carries_pkce() {
-        let (url, _state, verifier) = authorize_url(
-            "https://i",
-            "https://i/oauth/authorize",
-            "cid",
-            "https://w/cb",
-            "eudi.pid.mdoc.1",
+    fn offer_grants_parse() {
+        let offer = parse_credential_offer(
+            r#"{
+                "credential_issuer": "https://i",
+                "credential_configuration_ids": ["a", "b"],
+                "grants": {
+                    "urn:ietf:params:oauth:grant-type:pre-authorized_code": {
+                        "pre-authorized_code": "oaKazRN8I0IbtZ0C7JuMn5",
+                        "tx_code": { "length": 4, "input_mode": "numeric" }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        match &offer.grants[0] {
+            OfferGrant::PreAuthorizedCode { pre_authorized_code, tx_code, .. } => {
+                assert_eq!(pre_authorized_code, "oaKazRN8I0IbtZ0C7JuMn5");
+                assert_eq!(tx_code.as_ref().unwrap().length, Some(4));
+            }
+            _ => panic!("the pre-authorized grant"),
+        }
+        // Duplicated ids reject (§4.1.1 unique).
+        assert!(parse_credential_offer(
+            r#"{"credential_issuer": "https://i", "credential_configuration_ids": ["a", "a"]}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn credential_identifier_selection() {
+        let token = serde_json::json!({
+            "access_token": "t",
+            "authorization_details": [
+                { "type": "openid_credential",
+                  "credential_configuration_id": "cfg",
+                  "credential_identifiers": ["id-1", "id-2"] }
+            ]
+        });
+        let ids = credential_identifiers(&token).unwrap();
+        assert_eq!(ids, vec!["id-1", "id-2"]);
+        assert!(credential_identifiers(&serde_json::json!({"access_token": "t"})).is_none());
+    }
+
+    #[test]
+    fn authorization_server_selection() {
+        let meta: IssuerMetadata = serde_json::from_value(serde_json::json!({
+            "credential_issuer": "https://i",
+            "credential_endpoint": "https://i/credential",
+            "credential_configurations_supported": {}
+        }))
+        .unwrap();
+        // No authorization_servers: the issuer IS the AS (§12.2.4).
+        assert_eq!(select_authorization_server(&meta, None).unwrap(), "https://i");
+        let mut multi = meta.clone();
+        multi.authorization_servers = vec!["https://as1".into(), "https://as2".into()];
+        assert_eq!(
+            select_authorization_server(&multi, Some("https://as2")).unwrap(),
+            "https://as2"
         );
-        assert!(url.contains("code_challenge_method=S256"));
-        assert!(!verifier.is_empty());
+        assert!(select_authorization_server(&multi, Some("https://evil")).is_err());
+    }
+
+    #[test]
+    fn credential_request_body_shape() {
+        let body = CredentialRequestBody {
+            target: CredentialRequestTarget::ConfigurationId("cfg-1".into()),
+            proofs: serde_json::json!({ "jwt": ["p"] }),
+            credential_response_encryption: None,
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["credential_configuration_id"], "cfg-1");
+        assert!(json.get("credential_identifier").is_none());
+        assert_eq!(json["proofs"]["jwt"][0], "p");
+        let body2 = CredentialRequestBody {
+            target: CredentialRequestTarget::Identifier("id-1".into()),
+            proofs: serde_json::json!({ "jwt": [] }),
+            credential_response_encryption: None,
+        };
+        let json2 = serde_json::to_value(&body2).unwrap();
+        assert_eq!(json2["credential_identifier"], "id-1");
+        assert!(json2.get("credential_configuration_id").is_none());
     }
 }

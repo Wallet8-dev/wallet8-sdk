@@ -16,7 +16,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 # The platform (sentin8::mdoc is the mdoc engine; the shell/auth/tls
 # surfaces ride the same facade) - pinned by tag like every vertical.
-sentin8 = { git = "https://github.com/Sentin8/sentin8-sdk", tag = "sdk-v1.1.0" }
+sentin8 = { git = "https://github.com/Sentin8/sentin8-sdk", tag = "sdk-v1.1.1" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"

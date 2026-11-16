@@ -888,7 +888,6 @@ pub struct CredentialRequestBody {
 
 impl serde::Serialize for CredentialRequestBody {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap as _;
         let mut map = serde_json::Map::new();
         for (k, v) in self.target.body_member().as_object().cloned().unwrap_or_default() {
             map.insert(k, v);

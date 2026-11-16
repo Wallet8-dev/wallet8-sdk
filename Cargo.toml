@@ -28,7 +28,7 @@ p256 = { version = "0.13", features = ["ecdsa", "ecdsa-core", "pem", "ecdh"] }
 tokio = { version = "1", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 flate2 = "1"
 
 # The namespace facade - every consumer imports wallet8::{leaf}.

@@ -254,20 +254,24 @@ fn aes_gcm_seal(
     plaintext: &[u8],
     aad: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
-    use aes_gcm::aead::{Aead, KeyInit, Payload};
+    use aes_gcm::aead::{Aead, KeyInit, Payload, array::Array};
+    use aes_gcm::{Aes128Gcm, Aes256Gcm};
+    // The 96-bit IV (RFC 7518 §5.2) as Array<[u8; 12]> (the size the
+    // cipher infers from its own NonceSize; the tested form -
+    // aes-gcm 0.11's own aes128gcm/aes256gcm tests). Fail-closed on a
+    // wrong length (the callers always carry exactly 12 bytes).
+    if iv.len() != 12 {
+        return Err(format!("the IV length {} is not the 96-bit form", iv.len()));
+    }
+    let iv: [u8; 12] = iv.try_into().unwrap();
+    let nonce = Array(iv);
     let sealed: Vec<u8> = match cek.len() {
-        16 => aes_gcm::Aes128Gcm::new_from_slice(cek)
+        16 => Aes128Gcm::new_from_slice(cek)
             .map_err(|e| format!("the A128GCM key: {e}"))?
-            .encrypt(
-                aes_gcm::aead::generic_array::GenericArray::from_slice(iv),
-                Payload { msg: plaintext, aad },
-            ),
-        32 => aes_gcm::Aes256Gcm::new_from_slice(cek)
+            .encrypt(&nonce, Payload { msg: plaintext, aad }),
+        32 => Aes256Gcm::new_from_slice(cek)
             .map_err(|e| format!("the A256GCM key: {e}"))?
-            .encrypt(
-                aes_gcm::aead::generic_array::GenericArray::from_slice(iv),
-                Payload { msg: plaintext, aad },
-            ),
+            .encrypt(&nonce, Payload { msg: plaintext, aad }),
         n => return Err(format!("the CEK length {n} matches no AES-GCM form")),
     }
     .map_err(|e| format!("the AES-GCM encryption: {e}"))?;
@@ -380,20 +384,20 @@ mod tests {
     }
 
     fn aes_gcm_open(cek: &[u8], iv: &[u8], sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
-        use aes_gcm::aead::{Aead, KeyInit, Payload};
+        use aes_gcm::aead::{Aead, KeyInit, Payload, array::Array};
+        use aes_gcm::{Aes128Gcm, Aes256Gcm};
+        if iv.len() != 12 {
+            return Err(format!("the IV length {} is not the 96-bit form", iv.len()));
+        }
+        let iv: [u8; 12] = iv.try_into().unwrap();
+        let nonce = Array(iv);
         let plaintext: Vec<u8> = match cek.len() {
-            16 => aes_gcm::Aes128Gcm::new_from_slice(cek)
+            16 => Aes128Gcm::new_from_slice(cek)
                 .map_err(|e| e.to_string())?
-                .decrypt(
-                    aes_gcm::aead::generic_array::GenericArray::from_slice(iv),
-                    Payload { msg: sealed, aad },
-                ),
-            32 => aes_gcm::Aes256Gcm::new_from_slice(cek)
+                .decrypt(&nonce, Payload { msg: sealed, aad }),
+            32 => Aes256Gcm::new_from_slice(cek)
                 .map_err(|e| e.to_string())?
-                .decrypt(
-                    aes_gcm::aead::generic_array::GenericArray::from_slice(iv),
-                    Payload { msg: sealed, aad },
-                ),
+                .decrypt(&nonce, Payload { msg: sealed, aad }),
             n => return Err(format!("cek len {n}")),
         }
         .map_err(|e| format!("open: {e}"))?;

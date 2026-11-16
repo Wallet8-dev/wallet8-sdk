@@ -2,8 +2,7 @@
 //!
 //! The wallet-role credential issuance client implementing
 //! **OpenID for Verifiable Credential Issuance 1.0** (Final, 16 Sep 2025)
-//! - every function cites its spec section. This is a spec
-//! implementation, not a test-shaped adapter: the OIDF conformance
+//! - every function cites its spec section: the OIDF conformance
 //! suite verifies the behavior, but the CONTRACT is the specification.
 //!
 //! ## The flows (OID4VCI §3.3.3)

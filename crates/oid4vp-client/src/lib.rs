@@ -368,8 +368,8 @@ pub fn evaluate_dcql<'a>(
     holdings: &'a [WalletCredential],
 ) -> Result<Vec<DcqlMatch>, String> {
     let mut matches: Vec<DcqlMatch> = Vec::new();
-    let mut match_for = |q: &CredentialQuery,
-                         matches: &mut Vec<DcqlMatch>|
+    let match_for = |q: &CredentialQuery,
+                     matches: &mut Vec<DcqlMatch>|
      -> Result<bool, String> {
         for holding in holdings {
             if format_matches(q, holding) && value_rules_ok(q, holding) {

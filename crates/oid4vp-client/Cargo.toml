@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Wallet8 - the oid4vp-client crate."
+description = "Wallet8 - the OID4VP wallet client: request verification (the §5.9 prefixes), DCQL, vp_token assembly, direct_post + the encrypted response modes, the DC API, the status layer."
 
 [dependencies]
 sentin8.workspace = true
@@ -18,3 +18,5 @@ sha2.workspace = true
 p256.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+aes-gcm.workspace = true
+flate2.workspace = true

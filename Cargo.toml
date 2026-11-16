@@ -24,10 +24,12 @@ anyhow = "1"
 reqwest = { version = "0.12", features = ["json", "rustls-tls-native-roots-no-provider"], default-features = false }
 base64 = "0.22"
 sha2 = "0.10"
-p256 = { version = "0.13", features = ["ecdsa", "ecdsa-core", "pem"] }
+p256 = { version = "0.13", features = ["ecdsa", "ecdsa-core", "pem", "ecdh"] }
 tokio = { version = "1", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+aes-gcm = "0.10"
+flate2 = "1"
 
 # The namespace facade - every consumer imports wallet8::{leaf}.
 wallet8-oid4vci-client = { path = "crates/oid4vci-client" }

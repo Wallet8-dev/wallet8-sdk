@@ -665,6 +665,103 @@ pub async fn fetch_nonce(http: &reqwest::Client, nonce_endpoint: &str) -> Result
 
 // ── Proofs (OID4VCI §8.2 + Appendix F) ─────────────────────────────
 
+/// The DPoP proof (RFC 9449 §4.2 + HAIP §4): the JWT binding the
+/// HTTP request to the wallet's key - the sender-constraining the
+/// token/credential calls carry. Header `typ: dpop+jwt` + `jwk`;
+/// claims `htv` (method/uri), `iat`, `jti`, and `ath` (the base64url
+/// SHA-256 of the access token) when the request authorizes.
+///
+/// # Errors
+/// Signing failures.
+pub fn mint_dpop_proof(
+    key: &p256::ecdsa::SigningKey,
+    method: &str,
+    uri: &str,
+    ath: Option<&str>,
+    dpop_nonce: Option<&str>,
+) -> Result<String, String> {
+    use base64::Engine;
+    use p256::ecdsa::signature::Signer;
+    use sha2::Digest;
+    let b64 = |b: &[u8]| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+    };
+    let (scheme, path) = uri
+        .split_once("://")
+        .map(|(s, p)| (s.to_string(), p.to_string()))
+        .unwrap_or(("https".into(), uri.to_string()));
+    let (host_port, path_part) = path.split_once('/').map(|(h, p)| (h.to_string(), format!("/{p}"))).unwrap_or((path.clone(), "".to_string()));
+    let mut claims = serde_json::json!({
+        "htv": {"method": method, "uri": path_part, "host": host_port, "scheme": scheme},
+        "iat": chrono::Utc::now().timestamp(),
+        "jti": uuid::Uuid::new_v4().to_string(),
+    });
+    if let Some(token) = ath {
+        claims["ath"] = serde_json::json!(b64(&sha2::Sha256::digest(token.as_bytes())));
+    }
+    if let Some(nonce) = dpop_nonce {
+        claims["nonce"] = serde_json::json!(nonce);
+    }
+    let header = serde_json::json!({
+        "typ": "dpop+jwt",
+        "alg": "ES256",
+        "jwk": device_key_jwk(&key.verifying_key()),
+    });
+    let header_b64 = b64(serde_json::to_vec(&header).map_err(|e| e.to_string())?.as_slice());
+    let claims_b64 = b64(serde_json::to_vec(&claims).map_err(|e| e.to_string())?.as_slice());
+    let signing_input = format!("{header_b64}.{claims_b64}");
+    let sig: p256::ecdsa::Signature = key.sign(signing_input.as_bytes());
+    Ok(format!("{signing_input}.{}", b64(&sig.to_bytes())))
+}
+
+/// The Key Attestation (OID4VCI App. D.1): the `key-attestation+jwt`
+/// binding the attested key(s) to the storage/user-authentication
+/// properties. The proof's header carries it (App. F.1) when the
+/// configuration's `key_attestations_required` is present - the
+/// attestation's `nonce` = the c_nonce (App. D.1's freshness).
+///
+/// # Errors
+/// Signing failures.
+pub fn mint_key_attestation(
+    signing_key: &p256::ecdsa::SigningKey,
+    attested_jwk: serde_json::Value,
+    c_nonce: Option<&str>,
+    key_storage: Option<&[&str]>,
+    user_authentication: Option<&[&str]>,
+) -> Result<String, String> {
+    use base64::Engine;
+    use p256::ecdsa::signature::Signer;
+    let b64 = |b: &[u8]| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+    };
+    let now = chrono::Utc::now().timestamp();
+    let mut claims = serde_json::json!({
+        "iat": now,
+        // App. D.1: exp MUST be present when used with the jwt proof type.
+        "exp": now + 600,
+        "attested_keys": [attested_jwk],
+    });
+    if let Some(nonce) = c_nonce {
+        claims["nonce"] = serde_json::json!(nonce);
+    }
+    if let Some(storage) = key_storage {
+        claims["key_storage"] = serde_json::json!(storage);
+    }
+    if let Some(auth) = user_authentication {
+        claims["user_authentication"] = serde_json::json!(auth);
+    }
+    let header = serde_json::json!({
+        "typ": "key-attestation+jwt",
+        "alg": "ES256",
+        "jwk": device_key_jwk(&signing_key.verifying_key()),
+    });
+    let header_b64 = b64(serde_json::to_vec(&header).map_err(|e| e.to_string())?.as_slice());
+    let claims_b64 = b64(serde_json::to_vec(&claims).map_err(|e| e.to_string())?.as_slice());
+    let signing_input = format!("{header_b64}.{claims_b64}");
+    let sig: p256::ecdsa::Signature = signing_key.sign(signing_input.as_bytes());
+    Ok(format!("{signing_input}.{}", b64(&sig.to_bytes())))
+}
+
 /// The JWK form of the wallet's P-256 key (RFC 7517).
 pub fn device_key_jwk(key: &p256::ecdsa::VerifyingKey) -> serde_json::Value {
     let point = key.to_encoded_point(false);
@@ -694,11 +791,40 @@ pub fn mint_jwt_proof(
     issuer_identifier: &str,
     c_nonce: Option<&str>,
 ) -> Result<String, String> {
-    let header = serde_json::json!({
+    mint_jwt_proof_attested(key, client_id, issuer_identifier, c_nonce, None, None, None)
+}
+
+/// The [`mint_jwt_proof`] form carrying a Key Attestation (App. D -
+/// the `key_attestations_required` configuration demand): the
+/// attestation rides the JOSE header; the attested keys MUST include
+/// the proof's key (the binding the issuer checks).
+///
+/// # Errors
+/// Signing failures (the attestation + the proof).
+pub fn mint_jwt_proof_attested(
+    key: &p256::ecdsa::SigningKey,
+    client_id: Option<&str>,
+    issuer_identifier: &str,
+    c_nonce: Option<&str>,
+    attestation_signing_key: Option<&p256::ecdsa::SigningKey>,
+    key_storage: Option<&[&str]>,
+    user_authentication: Option<&[&str]>,
+) -> Result<String, String> {
+    let mut header = serde_json::json!({
         "typ": "openid4vci-proof+jwt",
         "alg": "ES256",
         "jwk": device_key_jwk(&key.verifying_key()),
     });
+    if let (Some(attester), Some(nonce)) = (attestation_signing_key, c_nonce) {
+        let attestation = mint_key_attestation(
+            attester,
+            device_key_jwk(&key.verifying_key()),
+            Some(nonce),
+            key_storage,
+            user_authentication,
+        )?;
+        header["key_attestation"] = serde_json::json!(attestation);
+    }
     let now = chrono::Utc::now().timestamp();
     let mut claims = serde_json::json!({
         "aud": issuer_identifier,

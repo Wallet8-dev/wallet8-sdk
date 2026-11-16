@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Wallet8 - the OID4VCI wallet client: issuer-metadata resolution, credential offers, the authorization-code flow, proof minting, batch + deferred issuance."
+description = "Wallet8 - the OID4VCI wallet client: issuer-metadata resolution, credential offers, the authorization-code flow, proof minting (+ key attestations, DPoP), batch + deferred issuance."
 
 [dependencies]
 sentin8.workspace = true

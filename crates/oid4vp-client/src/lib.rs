@@ -53,6 +53,18 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod verification;
+pub use verification::{verify_request_object, VerificationError, Verified, VerifierTrust};
+
+pub mod encryption;
+pub use encryption::{encrypt_response, EncryptionError};
+
+pub mod status;
+pub use status::{
+    check_status, decode_status_reference, entry_value, fetch_status_list,
+    inflate_status_list, parse_status_list_token, StatusList, StatusReference, StatusValue,
+};
+
 // ── The Authorization Request (OID4VP §5) ──────────────────────────
 
 /// The parsed Authorization Request (the request object's payload -
@@ -121,8 +133,10 @@ pub fn parse_request(payload: &str) -> Result<AuthorizationRequest, String> {
 
 /// The wallet's request-shape gate (§5.1/§5.2/§8.2): the nonce present;
 /// exactly one of dcql_query/scope; the response_mode/response_uri
-/// pairing; the redirect/response-uri exclusivity. The Client
-/// Identifier Prefix and signature checks belong to the caller
+/// pairing; the redirect/response-uri exclusivity; the
+/// transaction_data rejection (§5.1 - a wallet that does not support
+/// it MUST reject). The Client Identifier Prefix and signature
+/// checks belong to [`verification::verify_request_object`]
 /// (§5.9's per-prefix rules).
 ///
 /// # Errors
@@ -131,6 +145,13 @@ pub fn parse_request(payload: &str) -> Result<AuthorizationRequest, String> {
 pub fn check_request_shape(request: &AuthorizationRequest) -> Result<(), String> {
     if request.nonce.is_empty() {
         return Err("the request carries no nonce (§5.2 REQUIRED)".into());
+    }
+    // §8.4 + §5.1: the wallet does not support transaction_data - a
+    // request carrying it MUST reject, never a partial pass.
+    if !request.transaction_data.is_empty() {
+        return Err(
+            "the request carries transaction_data the wallet does not support (§5.1)".into(),
+        );
     }
     match (&request.dcql_query, &request.scope) {
         (Some(_), Some(_)) => {
@@ -156,6 +177,69 @@ pub fn check_request_shape(request: &AuthorizationRequest) -> Result<(), String>
         }
     }
     Ok(())
+}
+
+/// The `expected_origins` check (App. A.2): the platform-asserted
+/// origin MUST be among the allow-list on a signed DC API request -
+/// the replay defense across the DC API channel. An empty array
+/// (the unsigned form) passes trivially.
+///
+/// # Errors
+/// `invalid_request` (the §8.5 code) on a mismatch or a missing
+/// platform origin.
+pub fn check_expected_origins(
+    request: &AuthorizationRequest,
+    platform_origin: Option<&str>,
+) -> Result<(), String> {
+    if request.expected_origins.is_empty() {
+        return Ok(());
+    }
+    let Some(origin) = platform_origin else {
+        return Err(
+            "the request demands expected_origins but no platform origin is available (App. A.2)"
+                .into(),
+        );
+    };
+    if request.expected_origins.iter().any(|o| o == origin) {
+        Ok(())
+    } else {
+        Err(format!(
+            "the platform origin {origin:?} matches no expected_origins entry (App. A.2)"
+        ))
+    }
+}
+
+/// The scope alias resolution (§5.5): every scope value maps to a
+/// DCQL query the wallet's metadata defines. An unknown scope =
+/// `invalid_scope` (§8.5) - never a silent pass. The resolved
+/// request carries the mapped dcql_query (the caller then runs the
+/// shape gate + the evaluation over the resolved form).
+///
+/// # Errors
+/// A descriptive string naming the unknown alias or the empty set.
+pub fn resolve_scope_alias(
+    request: &AuthorizationRequest,
+    registry: &std::collections::BTreeMap<String, DcqlQuery>,
+) -> Result<AuthorizationRequest, String> {
+    let Some(scope) = request.scope.as_deref() else {
+        return Ok(request.clone());
+    };
+    let mut resolved = request.clone();
+    let mut query = DcqlQuery { credentials: vec![], credential_sets: vec![] };
+    for alias in scope.split_whitespace() {
+        let Some(mapped) = registry.get(alias) else {
+            return Err(format!(
+                "the scope value {alias:?} maps to no DCQL query the wallet defines (§5.5)"
+            ));
+        };
+        query.credentials.extend(mapped.credentials.iter().cloned());
+        query.credential_sets.extend(mapped.credential_sets.iter().cloned());
+    }
+    if query.credentials.is_empty() {
+        return Err("the scope resolved to no credential queries (§5.5)".into());
+    }
+    resolved.dcql_query = Some(query);
+    Ok(resolved)
 }
 
 // ── DCQL (OID4VP §6) ────────────────────────────────────────────────
@@ -704,6 +788,79 @@ pub async fn post_response(
             .and_then(|r| r.as_str())
             .map(str::to_string),
     })
+}
+
+/// The `direct_post.jwt` delivery (§8.3.1): the Authorization
+/// Response parameters (vp_token + state) encrypt to the verifier's
+/// ephemeral key (§8.3) and POST as `response=<JWE>`.
+///
+/// # Errors
+/// The encryption failures (no usable recipient key - the caller MAY
+/// fall back to the unencrypted §8.2 form per §8.3.1) + transport.
+pub async fn post_response_encrypted(
+    http: &reqwest::Client,
+    response_uri: &str,
+    vp_token: &serde_json::Value,
+    state: Option<&str>,
+    client_metadata: &serde_json::Value,
+) -> Result<DirectPostResult, String> {
+    let mut payload = serde_json::json!({"vp_token": vp_token});
+    if let Some(s) = state {
+        payload["state"] = serde_json::json!(s);
+    }
+    let jwe = encryption::encrypt_response(&payload, client_metadata)
+        .map_err(|e| format!("the response encryption: {e}"))?;
+    let body = form_urlencoded_one("response", &jwe);
+    let resp = http
+        .post(response_uri)
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("direct_post.jwt transport: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("the response uri answered {}", resp.status()));
+    }
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("the response uri body: {e}"))?;
+    Ok(DirectPostResult {
+        redirect_uri: json
+            .get("redirect_uri")
+            .and_then(|r| r.as_str())
+            .map(str::to_string),
+    })
+}
+
+/// The dc_api delivery (App. A.4): the response returns to the
+/// promise (the app resolves it) - NO back-channel POST. The
+/// `dc_api.jwt` form encrypts (§8.3 via App. A.2's channel).
+///
+/// # Errors
+/// The encryption failures on the `.jwt` form.
+pub fn dc_api_response(
+    vp_token: &serde_json::Value,
+    state: Option<&str>,
+    client_metadata: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let mut payload = serde_json::json!({"vp_token": vp_token});
+    if let Some(s) = state {
+        payload["state"] = serde_json::json!(s);
+    }
+    match client_metadata {
+        // The dc_api.jwt form: the response parameter carries the JWE.
+        Some(metadata) => {
+            let jwe = encryption::encrypt_response(&payload, metadata)
+                .map_err(|e| format!("the response encryption: {e}"))?;
+            Ok(serde_json::json!({"response": jwe}))
+        }
+        // The plain dc_api form: the parameters ride the promise.
+        None => Ok(payload),
+    }
 }
 
 fn form_urlencoded(pairs: &[(&str, &str)]) -> String {

@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: Copyright Logically Magic Inc. <hello@logicallymagic.com>
+// SPDX-FileCopyrightText: Copyright Hamid Jahanzad <Hamid@Jahanzad.com>
+// SPDX-FileCopyrightText: Copyright Contributors to the Wallet8:SDK
+// SPDX-License-Identifier: Apache-2.0
+
 //! # wallet8-holder-contracts - the holder service contracts
 //!
 //! The wallet8-holder service's wire contracts (the facade re-exports

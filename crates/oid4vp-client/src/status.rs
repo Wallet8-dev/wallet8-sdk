@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: Copyright Logically Magic Inc. <hello@logicallymagic.com>
+// SPDX-FileCopyrightText: Copyright Hamid Jahanzad <Hamid@Jahanzad.com>
+// SPDX-FileCopyrightText: Copyright Contributors to the Wallet8:SDK
+// SPDX-License-Identifier: Apache-2.0
+
 //! # The status layer - IETF Token Status List draft-14
 //!
 //! The `status.status_list` claim of an SD-JWT VC (the Referenced

@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: Copyright Logically Magic Inc. <hello@logicallymagic.com>
+// SPDX-FileCopyrightText: Copyright Hamid Jahanzad <Hamid@Jahanzad.com>
+// SPDX-FileCopyrightText: Copyright Contributors to the Wallet8:SDK
+// SPDX-License-Identifier: Apache-2.0
+
 //! # wallet8 - the namespace facade
 //!
 //! Every wallet8 crate imports through the workspace's namespace:

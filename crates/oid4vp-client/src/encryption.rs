@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: Copyright Logically Magic Inc. <hello@logicallymagic.com>
+// SPDX-FileCopyrightText: Copyright Hamid Jahanzad <Hamid@Jahanzad.com>
+// SPDX-FileCopyrightText: Copyright Contributors to the Wallet8:SDK
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Encrypted responses (OID4VP §8.3) - `direct_post.jwt`/`dc_api.jwt`
 //!
 //! The Authorization Response encrypted at the application layer:

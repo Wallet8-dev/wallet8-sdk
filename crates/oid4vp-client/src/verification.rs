@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: Copyright Logically Magic Inc. <hello@logicallymagic.com>
+// SPDX-FileCopyrightText: Copyright Hamid Jahanzad <Hamid@Jahanzad.com>
+// SPDX-FileCopyrightText: Copyright Contributors to the Wallet8:SDK
+// SPDX-License-Identifier: Apache-2.0
+
 //! # Request-object verification - the OID4VP §5.9 rules
 //!
 //! The wallet NEVER proceeds on an unverified request object

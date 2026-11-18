@@ -528,6 +528,7 @@ pub async fn push_authorization_request(
     issuer_state: Option<&str>,
     client_assertion: Option<&str>,
     scope: Option<&str>,
+    client_attestation: Option<&ClientAttestation>,
 ) -> Result<(String, String, PkcePair), String> {
     let pkce = pkce_pair();
     let state = uuid::Uuid::new_v4().simple().to_string();
@@ -554,9 +555,13 @@ pub async fn push_authorization_request(
         form.push(("client_assertion", assertion.to_string()));
         form.push(("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".to_string()));
     }
-    let resp = http
-        .post(par_endpoint)
-        .form(&form)
+    let mut req = http.post(par_endpoint).form(&form);
+    if let Some(att) = client_attestation {
+        req = req
+            .header("OAuth-Client-Attestation", &att.attestation)
+            .header("OAuth-Client-Attestation-PoP", &att.pop);
+    }
+    let resp = req
         .send()
         .await
         .map_err(|e| format!("par push: {e}"))?;
@@ -874,16 +879,14 @@ impl DpopSession {
         http: &reqwest::Client,
         endpoint: &str,
         mut form_builder: F,
+        attestation_minter: Option<&(dyn Fn() -> Result<ClientAttestation, String> + Send + Sync)>,
         ath: Option<&str>,
     ) -> Result<(reqwest::StatusCode, String, Option<String>), String>
     where
         F: FnMut() -> Result<Vec<(String, String)>, String>,
     {
-        if ath.is_some() {
-            self.retry(http, endpoint, ath, &mut form_builder, true).await
-        } else {
-            self.retry(http, endpoint, ath, &mut form_builder, false).await
-        }
+        self.retry(http, endpoint, &mut form_builder, attestation_minter, ath)
+            .await
     }
 
     /// The challenge-retry body shared by both forms of call.
@@ -891,9 +894,9 @@ impl DpopSession {
         &mut self,
         http: &reqwest::Client,
         endpoint: &str,
-        ath: Option<&str>,
         form_builder: &mut F,
-        _ath_call: bool,
+        attestation_minter: Option<&(dyn Fn() -> Result<ClientAttestation, String> + Send + Sync)>,
+        ath: Option<&str>,
     ) -> Result<(reqwest::StatusCode, String, Option<String>), String>
     where
         F: FnMut() -> Result<Vec<(String, String)>, String>,
@@ -902,6 +905,13 @@ impl DpopSession {
         loop {
             attempt += 1;
             let form = form_builder()?;
+            let mut req = http.post(endpoint).form(&form);
+            if let Some(minter) = attestation_minter {
+                let att = minter()?;
+                req = req
+                    .header("OAuth-Client-Attestation", &att.attestation)
+                    .header("OAuth-Client-Attestation-PoP", &att.pop);
+            }
             let proof = mint_dpop_proof(
                 &self.key,
                 "POST",
@@ -909,10 +919,8 @@ impl DpopSession {
                 ath,
                 self.nonce_for(endpoint).as_deref(),
             )?;
-            let resp = http
-                .post(endpoint)
+            let resp = req
                 .header("DPoP", proof)
-                .form(&form)
                 .send()
                 .await
                 .map_err(|e| format!("dpop post: {e}"))?;
@@ -951,6 +959,7 @@ impl DpopSession {
         code: &str,
         verifier: &str,
         client_assertion_audience: Option<&str>,
+        attestation_minter: Option<&(dyn Fn() -> Result<ClientAttestation, String> + Send + Sync)>,
     ) -> Result<serde_json::Value, String> {
         // The FULL form rebuilds PER ATTEMPT inside the session (a
         // nonce challenge retry re-mints the assertion with a fresh
@@ -977,7 +986,7 @@ impl DpopSession {
             Ok::<Vec<(String, String)>, String>(form)
         };
         let (status, body, _) = self
-            .post_form_with_dpop_builder(http, token_endpoint, form_builder, None)
+            .post_form_with_dpop_builder(http, token_endpoint, form_builder, attestation_minter, None)
             .await?;
         if !status.is_success() {
             return Err(format!("token exchange: HTTP {status}: {body}"));
@@ -1136,6 +1145,102 @@ pub fn mint_key_attestation(
     let signing_input = format!("{header_b64}.{claims_b64}");
     let sig: p256::ecdsa::Signature = signing_key.sign(signing_input.as_bytes());
     Ok(format!("{signing_input}.{}", b64(&sig.to_bytes())))
+}
+
+/// The OAuth Client Attestation minting (HAIP; the campaign's
+/// `client_attestation` client-auth variant): the pair of JWTs the
+/// draft carries on the `OAuth-Client-Attestation` /
+/// `OAuth-Client-Attestation-PoP` request headers at the token and
+/// PAR endpoints.
+///
+/// - the ATTESTATION: `typ: oauth-client-attestation+jwt`, ES256
+///   signed by the ATTESTER's key (the x5c header carries the
+///   attester's certificate chain - the verification trust); claims
+///   `iss` (the attester's trust-domain identifier),
+///   `sub` (the client_id being authenticated), `iat`/`nbf`/`exp`,
+///   and `cnf.jwk` = the CLIENT's proof key (the key the PoP shows).
+/// - the PoP: `typ: oauth-client-attestation-pop+jwt`, ES256 signed
+///   by the attested CLIENT key; claims `iss` (the client_id),
+///   `aud` (the attestation issuer - the same trust domain),
+///   `iat`, `nbf`, `exp`, fresh `jti` (the replay defense), and
+///   `challenge` when the AS advertises a challenge endpoint (None =
+///   absent; the suite's ProofJwtChallenge condition self-skips).
+#[derive(Debug, Clone)]
+pub struct ClientAttestation {
+    /// The `OAuth-Client-Attestation` header value (the attestation
+    /// JWT).
+    pub attestation: String,
+    /// The `OAuth-Client-Attestation-PoP` header value (the PoP JWT).
+    pub pop: String,
+}
+
+/// Mint the client-attestation pair (HAIP client_attestation auth).
+///
+/// The signer separation matters: `attester_key` is the TRUST-DOMAIN
+/// key (its x5c chain is what the verifier re-derives the attester
+/// identity from), `client_key` is the CLIENT instance key the
+/// attestation's `cnf.jwk` binds - the PoP MUST verify against it.
+///
+/// # Errors
+/// Signing / serialization failures.
+pub fn mint_client_attestation(
+    attester_key: &p256::ecdsa::SigningKey,
+    attester_x5c: &[String],
+    attestation_issuer: &str,
+    client_id: &str,
+    client_key: &p256::ecdsa::SigningKey,
+    audience: &str,
+    challenge: Option<&str>,
+    lifetime_seconds: i64,
+) -> Result<ClientAttestation, String> {
+    let now = chrono::Utc::now().timestamp();
+    // (1) The attestation JWT (typ oauth-client-attestation+jwt).
+    let att_header = serde_json::json!({
+        "typ": "oauth-client-attestation+jwt",
+        "alg": "ES256",
+        "x5c": attester_x5c,
+    });
+    let att_claims = serde_json::json!({
+        "iss": attestation_issuer,
+        "sub": client_id,
+        "iat": now,
+        "nbf": now,
+        "exp": now + lifetime_seconds,
+        "cnf": { "jwk": device_key_jwk(&client_key.verifying_key()) },
+    });
+    let attestation = assemble_es256_jwt(&att_header, &att_claims, attester_key)?;
+    // (2) The PoP JWT (typ oauth-client-attestation-pop+jwt).
+    let pop_header = serde_json::json!({
+        "typ": "oauth-client-attestation-pop+jwt",
+        "alg": "ES256",
+    });
+    let mut pop_claims = serde_json::json!({
+        "iss": client_id,
+        "aud": audience,
+        "iat": now,
+        "nbf": now,
+        "exp": now + lifetime_seconds,
+        "jti": uuid::Uuid::new_v4().to_string(),
+    });
+    if let Some(c) = challenge {
+        pop_claims["challenge"] = serde_json::json!(c);
+    }
+    let pop = assemble_es256_jwt(&pop_header, &pop_claims, client_key)?;
+    Ok(ClientAttestation { attestation, pop })
+}
+
+/// Assemble a compact ES256 JWT from header/claims values.
+fn assemble_es256_jwt(
+    header: &serde_json::Value,
+    claims: &serde_json::Value,
+    key: &p256::ecdsa::SigningKey,
+) -> Result<String, String> {
+    use p256::ecdsa::signature::Signer;
+    let header_b64 = b64u(serde_json::to_vec(header).map_err(|e| e.to_string())?.as_slice());
+    let payload_b64 = b64u(serde_json::to_vec(claims).map_err(|e| e.to_string())?.as_slice());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let sig: p256::ecdsa::Signature = key.sign(signing_input.as_bytes());
+    Ok(format!("{signing_input}.{}", b64u(&sig.to_bytes())))
 }
 
 /// The JWK form of the wallet's P-256 key (RFC 7517).

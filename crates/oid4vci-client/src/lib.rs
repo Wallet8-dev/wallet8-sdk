@@ -372,8 +372,56 @@ pub async fn resolve_as_metadata(
 ) -> Result<AsMetadata, String> {
     let base = as_identifier.trim_end_matches('/');
     let url = format!("{base}/.well-known/oauth-authorization-server");
+    fetch_as_metadata(http, &url).await
+}
+
+/// Fetch the issuer metadata from an EXPLICIT URL (the conformance
+/// campaign override: the suite hosts the RFC8414 form whose path
+/// carries the instance prefix - the `{issuer}/.well-known/...`
+/// derivation would target the wrong path). Performs the §12.2.2
+/// credential_issuer identity check exactly like the derived form.
+///
+/// # Errors
+/// Transport + parse failures, or the identity mismatch.
+pub async fn fetch_issuer_metadata(
+    http: &reqwest::Client,
+    metadata_url: &str,
+    issuer_identifier: &str,
+) -> Result<IssuerMetadata, String> {
     let resp = http
-        .get(&url)
+        .get(metadata_url)
+        .send()
+        .await
+        .map_err(|e| format!("issuer metadata fetch: {e}"))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("issuer metadata read: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("issuer metadata: HTTP {status}"));
+    }
+    let metadata: IssuerMetadata =
+        serde_json::from_str(&body).map_err(|e| format!("issuer metadata parse: {e}"))?;
+    if metadata.credential_issuer != issuer_identifier {
+        return Err(format!(
+            "the metadata credential_issuer {} does not match the requested identifier {} (§12.2.2)",
+            metadata.credential_issuer, issuer_identifier
+        ));
+    }
+    Ok(metadata)
+}
+
+/// Fetch the AS metadata from an EXPLICIT URL (the campaign override).
+///
+/// # Errors
+/// Transport + parse failures.
+pub async fn fetch_as_metadata(
+    http: &reqwest::Client,
+    metadata_url: &str,
+) -> Result<AsMetadata, String> {
+    let resp = http
+        .get(metadata_url)
         .send()
         .await
         .map_err(|e| format!("as metadata fetch: {e}"))?;
@@ -478,6 +526,8 @@ pub async fn push_authorization_request(
     redirect_uri: &str,
     details: &serde_json::Value,
     issuer_state: Option<&str>,
+    client_assertion: Option<&str>,
+    scope: Option<&str>,
 ) -> Result<(String, String, PkcePair), String> {
     let pkce = pkce_pair();
     let state = uuid::Uuid::new_v4().simple().to_string();
@@ -492,9 +542,17 @@ pub async fn push_authorization_request(
             "authorization_details",
             serde_json::to_string(details).map_err(|e| e.to_string())?,
         ),
+        (
+            "scope",
+            scope.as_deref().unwrap_or("openid").to_string(),
+        ),
     ];
     if let Some(iss_state) = issuer_state {
         form.push(("issuer_state", iss_state.to_string()));
+    }
+    if let Some(assertion) = client_assertion {
+        form.push(("client_assertion", assertion.to_string()));
+        form.push(("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".to_string()));
     }
     let resp = http
         .post(par_endpoint)
@@ -542,16 +600,28 @@ pub async fn exchange_code(
     redirect_uri: &str,
     code: &str,
     verifier: &str,
+    client_assertion: Option<&str>,
 ) -> Result<serde_json::Value, String> {
+    let grant_form: Vec<(&str, String)> = {
+        let mut f: Vec<(&str, String)> = vec![
+            ("grant_type", "authorization_code".to_string()),
+            ("client_id", client_id.to_string()),
+            ("redirect_uri", redirect_uri.to_string()),
+            ("code", code.to_string()),
+            ("code_verifier", verifier.to_string()),
+        ];
+        if let Some(assertion) = client_assertion {
+            f.push(("client_assertion", assertion.to_string()));
+            f.push((
+                "client_assertion_type",
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".to_string(),
+            ));
+        }
+        f
+    };
     let resp = http
         .post(token_endpoint)
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("client_id", client_id),
-            ("redirect_uri", redirect_uri),
-            ("code", code),
-            ("code_verifier", verifier),
-        ])
+        .form(&grant_form)
         .send()
         .await
         .map_err(|e| format!("token exchange: {e}"))?;
@@ -664,11 +734,15 @@ pub async fn fetch_nonce(http: &reqwest::Client, nonce_endpoint: &str) -> Result
 
 // ── Proofs (OID4VCI §8.2 + Appendix F) ─────────────────────────────
 
-/// The DPoP proof (RFC 9449 §4.2 + HAIP §4): the JWT binding the
-/// HTTP request to the wallet's key - the sender-constraining the
-/// token/credential calls carry. Header `typ: dpop+jwt` + `jwk`;
-/// claims `htv` (method/uri), `iat`, `jti`, and `ath` (the base64url
-/// SHA-256 of the access token) when the request authorizes.
+/// The DPoP proof (RFC 9449 §4.2): the JWT binding the HTTP request
+/// to the wallet's key - the sender-constraining the token and every
+/// access-token-bearing call carries. Header `typ: dpop+jwt`,
+/// `alg: ES256`, and the PUBLIC `jwk` (no private material); the
+/// claims are the FLAT form the RFC mandates: `htm` + `htu` (the
+/// full request URL, scheme + host + path, no query/fragment), `iat`
+/// + `exp`, a fresh `jti` per attempt, and `ath` (the base64url
+/// SHA-256 of the access token) ONLY when the request presents one -
+/// a token-endpoint proof NEVER carries `ath` (RFC 9449 §4.2).
 ///
 /// # Errors
 /// Signing failures.
@@ -679,24 +753,25 @@ pub fn mint_dpop_proof(
     ath: Option<&str>,
     dpop_nonce: Option<&str>,
 ) -> Result<String, String> {
-    use base64::Engine;
     use p256::ecdsa::signature::Signer;
     use sha2::Digest;
-    let b64 = |b: &[u8]| {
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
-    };
-    let (scheme, path) = uri
-        .split_once("://")
-        .map(|(s, p)| (s.to_string(), p.to_string()))
-        .unwrap_or(("https".into(), uri.to_string()));
-    let (host_port, path_part) = path.split_once('/').map(|(h, p)| (h.to_string(), format!("/{p}"))).unwrap_or((path.clone(), "".to_string()));
+    // The htu (RFC 9449 §4.2): the ASCII serialization of the
+    // request's target without query/fragment.
+    let htu = uri
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(uri)
+        .to_string();
+    let now = chrono::Utc::now().timestamp();
     let mut claims = serde_json::json!({
-        "htv": {"method": method, "uri": path_part, "host": host_port, "scheme": scheme},
-        "iat": chrono::Utc::now().timestamp(),
+        "htm": method,
+        "htu": htu,
+        "iat": now,
+        "exp": now + 300,
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     if let Some(token) = ath {
-        claims["ath"] = serde_json::json!(b64(&sha2::Sha256::digest(token.as_bytes())));
+        claims["ath"] = serde_json::json!(b64u(&sha2::Sha256::digest(token.as_bytes())));
     }
     if let Some(nonce) = dpop_nonce {
         claims["nonce"] = serde_json::json!(nonce);
@@ -706,11 +781,313 @@ pub fn mint_dpop_proof(
         "alg": "ES256",
         "jwk": device_key_jwk(&key.verifying_key()),
     });
-    let header_b64 = b64(serde_json::to_vec(&header).map_err(|e| e.to_string())?.as_slice());
-    let claims_b64 = b64(serde_json::to_vec(&claims).map_err(|e| e.to_string())?.as_slice());
+    let header_b64 = b64u(serde_json::to_vec(&header).map_err(|e| e.to_string())?.as_slice());
+    let claims_b64 = b64u(serde_json::to_vec(&claims).map_err(|e| e.to_string())?.as_slice());
     let signing_input = format!("{header_b64}.{claims_b64}");
     let sig: p256::ecdsa::Signature = key.sign(signing_input.as_bytes());
-    Ok(format!("{signing_input}.{}", b64(&sig.to_bytes())))
+    Ok(format!("{signing_input}.{}", b64u(&sig.to_bytes())))
+}
+
+/// The `DPoP-Nonce` challenge (RFC 9449): the endpoint's response
+/// header carrying the nonce the RETRY must present. Both postures
+/// are challenges, never terminal failures:
+/// - the AS form (§5): 400 + JSON body `error: use_dpop_nonce` +
+///   `DPoP-Nonce`;
+/// - the resource form (§6.1): 401 + `DPoP-Nonce` (+ the
+///   WWW-Authenticate: DPoP error scheme) - an UNAUTHORIZED response
+///   with a DPoP-Nonce is the resource server demanding the nonce.
+/// Returns None when neither posture applies (the response then
+/// carries its normal error for the caller).
+///
+/// # Errors
+/// Transport-typed reads only - the header parse never fails.
+pub async fn dpop_nonce_from_response(resp: &reqwest::Response) -> Option<String> {
+    let status = resp.status();
+    let has_nonce_header = resp
+        .headers()
+        .contains_key(reqwest::header::HeaderName::from_static("dpop-nonce"));
+    let is_challenge = has_nonce_header
+        && (status == reqwest::StatusCode::BAD_REQUEST
+            || status == reqwest::StatusCode::UNAUTHORIZED);
+    if !is_challenge {
+        return None;
+    }
+    resp.headers()
+        .get("dpop-nonce")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+/// The DPoP session (RFC 9449 §5): the wallet's per-issuance state
+/// driving the token exchange and every access-token-bearing call -
+/// one device key (the AS binds the token to its thumbprint, §5;
+/// the resource proofs MUST present the same key), the endpoint-
+/// scoped nonce cache (the AS and each resource server mint
+/// INDEPENDENT nonces), and the challenge-retry wrappers.
+///
+/// The wrappers transparently handle the `use_dpop_nonce` posture:
+/// the first call goes out with the cached nonce (or none), a 400
+/// `use_dpop_nonce` + `DPoP-Nonce` response is a CHALLENGE (not a
+/// failure) - the session caches the nonce and retries ONCE with a
+/// fresh proof carrying it (RFC 9449 §8.2: the retried request MUST
+/// be accepted when the presented nonce matches; a second challenge
+/// is a defect).
+pub struct DpopSession {
+    key: p256::ecdsa::SigningKey,
+    nonces: std::collections::BTreeMap<String, String>,
+}
+
+impl DpopSession {
+    /// Bind the session to the wallet's device key.
+    pub fn new(key: p256::ecdsa::SigningKey) -> Self {
+        Self { key, nonces: Default::default() }
+    }
+
+    /// The session's proof key: the SAME key every DPoP proof this
+    /// session signs with (the token + resource proofs share it - the
+    /// AS's `cnf.jkt` binding means the resource validation compares
+    /// the proof `jwk` against the token's bound thumbprint).
+    /// The OID4VCI jwt proof (App. F) reuses it - the issuer's bound
+    /// key and the DPoP key are one wallet device key.
+    pub fn proof_key(&self) -> &p256::ecdsa::SigningKey {
+        &self.key
+    }
+
+    /// The endpoint-scoped cached nonce (AS + resource servers keep
+    /// separate challenges).
+    fn nonce_for(&self, endpoint: &str) -> Option<String> {
+        self.nonces.get(endpoint).cloned()
+    }
+
+    fn learn_nonce(&mut self, endpoint: &str, nonce: String) {
+        self.nonces.insert(endpoint.to_string(), nonce);
+    }
+
+    /// The retry loop proper (RFC 9449 §5/§6.1): each attempt builds
+    /// the form FRESH via the builder (a nonce retry re-mints mutable
+    /// parts - the RFC 7523 client assertion gets a new `jti`, RFC
+    /// 7523 §4.3), signs a fresh DPoP proof, and on a
+    /// DPoP-Nonce-carrying 400/401 challenge retries ONCE with the
+    /// learned nonce.
+    async fn post_form_with_dpop_builder<F>(
+        &mut self,
+        http: &reqwest::Client,
+        endpoint: &str,
+        mut form_builder: F,
+        ath: Option<&str>,
+    ) -> Result<(reqwest::StatusCode, String, Option<String>), String>
+    where
+        F: FnMut() -> Result<Vec<(String, String)>, String>,
+    {
+        if ath.is_some() {
+            self.retry(http, endpoint, ath, &mut form_builder, true).await
+        } else {
+            self.retry(http, endpoint, ath, &mut form_builder, false).await
+        }
+    }
+
+    /// The challenge-retry body shared by both forms of call.
+    async fn retry<F>(
+        &mut self,
+        http: &reqwest::Client,
+        endpoint: &str,
+        ath: Option<&str>,
+        form_builder: &mut F,
+        _ath_call: bool,
+    ) -> Result<(reqwest::StatusCode, String, Option<String>), String>
+    where
+        F: FnMut() -> Result<Vec<(String, String)>, String>,
+    {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let form = form_builder()?;
+            let proof = mint_dpop_proof(
+                &self.key,
+                "POST",
+                endpoint,
+                ath,
+                self.nonce_for(endpoint).as_deref(),
+            )?;
+            let resp = http
+                .post(endpoint)
+                .header("DPoP", proof)
+                .form(&form)
+                .send()
+                .await
+                .map_err(|e| format!("dpop post: {e}"))?;
+            let status = resp.status();
+            if let Some(nonce) = dpop_nonce_from_response(&resp).await {
+                let body = resp.text().await.map_err(|e| format!("dpop read: {e}"))?;
+                if attempt == 1 {
+                    self.learn_nonce(endpoint, nonce);
+                    continue;
+                }
+                return Ok((status, body, Some(nonce)));
+            }
+            let body = resp.text().await.map_err(|e| format!("dpop read: {e}"))?;
+            return Ok((status, body, None));
+        }
+    }
+
+    /// The authorization-code token exchange with the DPoP binding
+    /// (RFC 9449 §5): the code + PKCE + the client assertion + the
+    /// proof (NO `ath` - the token call presents no access token).
+    /// The `client_assertion_audience` (Some = private_key_jwt): the
+    /// session MINTS a fresh RFC 7523 assertion PER ATTEMPT - the
+    /// challenge-retry round MUST NOT replay an assertion's `jti`
+    /// (RFC 7523 §4.3 + the suite's CheckForClientAssertionJtiReuse).
+    /// Returns the parsed token response; the access token is bound
+    /// to this session's key thumbprint (`cnf.jkt`).
+    ///
+    /// # Errors
+    /// Transport + the token error envelope (§6.3) after the retry.
+    pub async fn exchange_code(
+        &mut self,
+        http: &reqwest::Client,
+        token_endpoint: &str,
+        client_id: &str,
+        redirect_uri: &str,
+        code: &str,
+        verifier: &str,
+        client_assertion_audience: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        // The FULL form rebuilds PER ATTEMPT inside the session (a
+        // nonce challenge retry re-mints the assertion with a fresh
+        // jti - RFC 7523 §4.3 replay defense). The key clones OUT of
+        // self so the builder owns it (the borrow checker).
+        let key_for_assertion = self.key.clone();
+        let client_id_owned = client_id.to_string();
+        let form_builder = move || {
+            let mut form: Vec<(String, String)> = vec![
+                ("grant_type".into(), "authorization_code".into()),
+                ("client_id".into(), client_id_owned.clone()),
+                ("redirect_uri".into(), redirect_uri.into()),
+                ("code".into(), code.into()),
+                ("code_verifier".into(), verifier.into()),
+            ];
+            if let Some(audience) = client_assertion_audience {
+                let assertion = mint_client_assertion(&key_for_assertion, &client_id_owned, audience)?;
+                form.push(("client_assertion".into(), assertion));
+                form.push((
+                    "client_assertion_type".into(),
+                    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".into(),
+                ));
+            }
+            Ok::<Vec<(String, String)>, String>(form)
+        };
+        let (status, body, _) = self
+            .post_form_with_dpop_builder(http, token_endpoint, form_builder, None)
+            .await?;
+        if !status.is_success() {
+            return Err(format!("token exchange: HTTP {status}: {body}"));
+        }
+        serde_json::from_str(&body).map_err(|e| format!("token parse: {e}"))
+    }
+
+    /// POST an access-token-bearing protected-resource call with the
+    /// DPoP binding (the credential §8.2, deferred §9, and
+    /// notification §11 endpoints): `Authorization: DPoP` (the
+    /// sender-constrained scheme, RFC 9449 §7.1) + the proof carrying
+    /// `ath` (the access-token hash) + the resource endpoint's own
+    /// nonce when challenged (the AS and the resource servers keep
+    /// INDEPENDENT nonces).
+    ///
+    /// # Errors
+    /// Transport + the endpoint's error envelope after the retry.
+    pub async fn post_protected_json(
+        &mut self,
+        http: &reqwest::Client,
+        endpoint: &str,
+        access_token: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let (status, body_text, _) = self
+            .post_form_with_dpop_raw(
+                http,
+                endpoint,
+                access_token,
+                Some(serde_json::to_string(body).map_err(|e| e.to_string())?),
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(format!("protected call: HTTP {status}: {body_text}"));
+        }
+        serde_json::from_str(&body_text).map_err(|e| format!("protected parse: {e}"))
+    }
+
+    /// The fire-and-forget protected call (§11 notifications): the
+    /// same DPoP binding; the HTTP status decides.
+    ///
+    /// # Errors
+    /// Transport + a non-2xx status after the retry.
+    pub async fn post_protected_notify(
+        &mut self,
+        http: &reqwest::Client,
+        endpoint: &str,
+        access_token: &str,
+        body: &serde_json::Value,
+    ) -> Result<(), String> {
+        let (status, body_text, _) = self
+            .post_form_with_dpop_raw(
+                http,
+                endpoint,
+                access_token,
+                Some(serde_json::to_string(body).map_err(|e| e.to_string())?),
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(format!("notification: HTTP {status}: {body_text}"));
+        }
+        Ok(())
+    }
+
+    async fn post_form_with_dpop_raw(
+        &mut self,
+        http: &reqwest::Client,
+        endpoint: &str,
+        access_token: &str,
+        json_body: Option<String>,
+    ) -> Result<(reqwest::StatusCode, String, Option<String>), String> {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let proof = mint_dpop_proof(
+                &self.key,
+                "POST",
+                endpoint,
+                Some(access_token),
+                self.nonce_for(endpoint).as_deref(),
+            )?;
+            // The DPoP access token rides the DPoP auth scheme
+            // (RFC 9449 §7.1: `Authorization: DPoP <token>` - the
+            // suite's ExtractDpopAccessTokenFromHeader gates on the
+            // scheme; Bearer is the NON-sender-constrained form).
+            let mut req = http
+                .post(endpoint)
+                .header("DPoP", proof)
+                .header("Authorization", format!("DPoP {access_token}"));
+            if let Some(b) = &json_body {
+                req = req.header("Content-Type", "application/json").body(b.clone());
+            }
+            let resp = req.send().await.map_err(|e| format!("dpop post: {e}"))?;
+            let status = resp.status();
+            if let Some(nonce) = dpop_nonce_from_response(&resp).await {
+                let body = resp.text().await.map_err(|e| format!("dpop read: {e}"))?;
+                // RFC 9449 5/6.1: any DPoP-Nonce-carrying 400/401 is
+                // the challenge - the FIRST one retries with the
+                // nonce; a second challenge on the SAME nonce is a
+                // defect (RFC 9449 8.2) and surfaces as the error.
+                if attempt == 1 {
+                    self.learn_nonce(endpoint, nonce);
+                    continue;
+                }
+                return Ok((status, body, Some(nonce)));
+            }
+            let body = resp.text().await.map_err(|e| format!("dpop read: {e}"))?;
+            return Ok((status, body, None));
+        }
+    }
 }
 
 /// The Key Attestation (OID4VCI App. D.1): the `key-attestation+jwt`
@@ -771,6 +1148,43 @@ pub fn device_key_jwk(key: &p256::ecdsa::VerifyingKey) -> serde_json::Value {
         "x": b64u(&bytes[1..33]),
         "y": b64u(&bytes[33..65]),
     })
+}
+
+/// The RFC 7523 private_key_jwt Client Assertion (§9 - the
+/// token_endpoint_auth method the mock issuer validates at PAR + token;
+/// the ES256 signature over the RFC 7523 §2.2 claims). The `jti` is a
+/// fresh UUID (the replay defense); `aud` = the issuer identifier; the
+/// `sub`/`iss` = the client_id.
+///
+/// # Errors
+/// Signing failures.
+pub fn mint_client_assertion(
+    key: &p256::ecdsa::SigningKey,
+    client_id: &str,
+    audience: &str,
+) -> Result<String, String> {
+    use base64::Engine;
+    use p256::ecdsa::signature::Signer;
+    let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+    let header = serde_json::json!({
+        "typ": "JWT",
+        "alg": "ES256",
+        "kid": format!("{}-key", client_id),
+        "jwk": device_key_jwk(&key.verifying_key()),
+    });
+    let claims = serde_json::json!({
+        "iss": client_id,
+        "sub": client_id,
+        "aud": audience,
+        "iat": chrono::Utc::now().timestamp(),
+        "exp": chrono::Utc::now().timestamp() + 300,
+        "jti": uuid::Uuid::new_v4().to_string(),
+    });
+    let header_b64 = b64(serde_json::to_vec(&header).map_err(|e| e.to_string())?.as_slice());
+    let claims_b64 = b64(serde_json::to_vec(&claims).map_err(|e| e.to_string())?.as_slice());
+    let signing_input = format!("{header_b64}.{claims_b64}");
+    let sig: p256::ecdsa::Signature = key.sign(signing_input.as_bytes());
+    Ok(format!("{signing_input}.{}", b64(&sig.to_bytes())))
 }
 
 /// Mint the `openid4vci-proof+jwt` (Appendix F.1): `typ`
@@ -899,6 +1313,46 @@ impl serde::Serialize for CredentialRequestBody {
     }
 }
 
+/// Decode a Credential Response value (§8.3) into the enum the
+/// request path returns - the shared form the DpopSession-protected
+/// call and the plain call both land on.
+///
+/// # Errors
+/// Neither credentials nor transaction_id (§8.3).
+pub fn parse_credential_response(v: &serde_json::Value) -> Result<CredentialResponse, String> {
+    if let Some(creds) = v.get("credentials").and_then(|c| c.as_array()) {
+        let mut out = Vec::new();
+        for entry in creds {
+            out.push(MintedCredential {
+                credential: entry
+                    .get("credential")
+                    .and_then(|c| c.as_str())
+                    .ok_or("a credentials entry carries no credential (§8.3)")?
+                    .to_string(),
+            });
+        }
+        return Ok(CredentialResponse::Issued {
+            credentials: out,
+            notification_id: v
+                .get("notification_id")
+                .and_then(|n| n.as_str())
+                .map(str::to_string),
+        });
+    }
+    if let Some(tx) = v.get("transaction_id").and_then(|t| t.as_str()) {
+        let interval = v.get("interval").and_then(|i| i.as_u64()).unwrap_or(0);
+        return Ok(CredentialResponse::Deferred {
+            transaction_id: tx.to_string(),
+            interval,
+            notification_id: v
+                .get("notification_id")
+                .and_then(|n| n.as_str())
+                .map(str::to_string),
+        });
+    }
+    Err("the response carries neither credentials nor transaction_id (§8.3)".into())
+}
+
 /// A minted credential entry (§8.3 + App. A: the mdoc credential is
 /// the base64url IssuerSigned CBOR (A.2.4); the dc+sd-jwt credential
 /// is the compact SD-JWT string (A.3.4); the jwt_vc_json credential
@@ -913,8 +1367,14 @@ pub struct MintedCredential {
 /// or the deferred form (`transaction_id` + `interval`).
 #[derive(Debug, Clone)]
 pub enum CredentialResponse {
-    /// The 200 immediate form: the `credentials` array.
-    Issued(Vec<MintedCredential>),
+    /// The 200 immediate form: the `credentials` array (+ the
+    /// `notification_id` when the issuer uses notifications, ss11.4).
+    Issued {
+        /// The minted credentials.
+        credentials: Vec<MintedCredential>,
+        /// The `notification_id` when the issuer uses notifications.
+        notification_id: Option<String>,
+    },
     /// The 202 deferred form (§9): poll after `interval` seconds.
     Deferred {
         /// The transaction id.
@@ -969,7 +1429,13 @@ pub async fn request_credential(
                     .to_string(),
             });
         }
-        return Ok(CredentialResponse::Issued(out));
+        return Ok(CredentialResponse::Issued {
+            credentials: out,
+            notification_id: v
+                .get("notification_id")
+                .and_then(|n| n.as_str())
+                .map(str::to_string),
+        });
     }
     if let Some(tx) = v.get("transaction_id").and_then(|t| t.as_str()) {
         let interval = v.get("interval").and_then(|i| i.as_u64()).unwrap_or(0);

@@ -344,10 +344,28 @@ pub struct AsMetadata {
     pub pre_authorized_grant_anonymous_access_supported: bool,
 }
 
-/// Resolve the Credential Issuer metadata (§12.2.2): GET
-/// `{issuer}/.well-known/openid-credential-issuer`, then verify the
-/// returned `credential_issuer` equals the identifier the metadata
-/// was fetched from (a mismatch MUST NOT be used, §12.2.4).
+/// Build the RFC 8414 well-known URL for an issuer identifier:
+/// `https://host/.well-known/<name>/<path>` when the identifier
+/// carries a path component, `https://host/.well-known/<name>`
+/// otherwise. OID4VCI draft 16 adopted exactly this rule (the suite
+/// rejects the legacy `.../<path>/.well-known/...` form).
+pub fn well_known_url(identifier: &str, name: &str) -> String {
+    let id = identifier.trim_end_matches('/');
+    match id.split_once("://") {
+        Some((scheme, rest)) => match rest.split_once('/') {
+            Some((host, path)) => {
+                format!("{scheme}://{host}/.well-known/{name}/{path}")
+            }
+            None => format!("{id}/.well-known/{name}"),
+        },
+        None => format!("{id}/.well-known/{name}"),
+    }
+}
+
+/// Resolve the Credential Issuer metadata (§12.2.2): GET the RFC 8414
+/// well-known URL for the issuer, then verify the returned
+/// `credential_issuer` equals the identifier the metadata was fetched
+/// from (a mismatch MUST NOT be used, §12.2.4).
 ///
 /// # Errors
 /// Transport + parse failures, or the identity mismatch.
@@ -355,8 +373,7 @@ pub async fn resolve_issuer_metadata(
     http: &reqwest::Client,
     issuer_identifier: &str,
 ) -> Result<IssuerMetadata, String> {
-    let base = issuer_identifier.trim_end_matches('/');
-    let url = format!("{base}/.well-known/openid-credential-issuer");
+    let url = well_known_url(issuer_identifier, "openid-credential-issuer");
     let resp = http
         .get(&url)
         .send()
@@ -382,7 +399,7 @@ pub async fn resolve_issuer_metadata(
 }
 
 /// Resolve the Authorization Server metadata (§12.2.4 + RFC 8414):
-/// GET `{as}/.well-known/oauth-authorization-server`.
+/// GET the RFC 8414 well-known URL for the AS identifier.
 ///
 /// # Errors
 /// Transport + parse failures.
@@ -390,8 +407,7 @@ pub async fn resolve_as_metadata(
     http: &reqwest::Client,
     as_identifier: &str,
 ) -> Result<AsMetadata, String> {
-    let base = as_identifier.trim_end_matches('/');
-    let url = format!("{base}/.well-known/oauth-authorization-server");
+    let url = well_known_url(as_identifier, "oauth-authorization-server");
     fetch_as_metadata(http, &url).await
 }
 

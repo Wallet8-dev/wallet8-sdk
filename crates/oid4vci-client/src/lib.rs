@@ -295,6 +295,11 @@ pub struct IssuerMetadata {
     /// `deferred_credential_endpoint` (OPTIONAL, §9).
     #[serde(default)]
     pub deferred_credential_endpoint: Option<String>,
+    /// `credential_response_encryption` (§7.3, TOP-LEVEL since draft
+    /// 16): the issuer's advertised alg/enc families + whether the
+    /// wallet MUST encrypt (`encryption_required`).
+    #[serde(default)]
+    pub credential_response_encryption: Option<serde_json::Value>,
     /// `notification_endpoint` (OPTIONAL, §11).
     #[serde(default)]
     pub notification_endpoint: Option<String>,

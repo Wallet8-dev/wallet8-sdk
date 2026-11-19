@@ -326,6 +326,11 @@ pub struct IssuerMetadata {
 /// well-known of the AS identifier - never guessed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AsMetadata {
+    /// The RFC 8414 `issuer` member - MUST equal the URL the document
+    /// was retrieved from (§4.3); a mismatch makes the metadata
+    /// unusable (the discovery-issuer-mismatch rule).
+    #[serde(default)]
+    pub issuer: Option<String>,
     /// `authorization_endpoint` (RFC 8414).
     pub authorization_endpoint: String,
     /// `token_endpoint` (RFC 8414).
@@ -504,7 +509,32 @@ pub async fn fetch_as_metadata(
     if !status.is_success() {
         return Err(format!("as metadata: HTTP {status}"));
     }
-    serde_json::from_str(&body).map_err(|e| format!("as metadata parse: {e}"))
+    let metadata: AsMetadata = serde_json::from_str(&body)
+        .map_err(|e| format!("as metadata parse: {e}"))?;
+    // RFC 8414 §4.3 + the HAIP profile: the document's `issuer` MUST
+    // equal the URL the document was retrieved from. The fetch-URL
+    // issuer candidates: the exact URL, the infix-free form (host +
+    // path), and both slash shapes - then REJECT on any mismatch.
+    if let Some(issuer) = &metadata.issuer {
+        let mut candidates: Vec<String> = vec![metadata_url.to_string()];
+        if let Some((base, rest)) = metadata_url.split_once("/.well-known/oauth-authorization-server") {
+            let path = rest.to_string();
+            if path.is_empty() {
+                candidates.push(base.to_string());
+            } else {
+                candidates.push(format!("{base}{path}"));
+                candidates.push(format!("{base}/{}", path.trim_start_matches('/')));
+            }
+            candidates.push(base.to_string());
+        }
+        let norm = |u: &str| u.trim_end_matches('/').to_string();
+        if !candidates.iter().any(|c| norm(c) == norm(issuer)) {
+            return Err(format!(
+                "the discovery document's issuer {issuer} does not match the URL the document was retrieved from ({metadata_url}) - REJECTING the AS metadata (RFC 8414 §4.3)"
+            ));
+        }
+    }
+    Ok(metadata)
 }
 
 /// The AS identifier for an issuance (§12.2.4): the offer's

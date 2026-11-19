@@ -1617,9 +1617,12 @@ pub fn decrypt_ecdh_es_a256gcm(
     serde_json::from_slice(&plain).map_err(|e| format!("jwe payload parse: {e}"))
 }
 
-/// The NIST ConcatKDF for the CEK derivation (one round; SHA-256).
+/// The NIST SP 800-56A §5.8.1 ConcatKDF - the JWA ECDH-ES form:
+/// Counter(4) || Z || AlgorithmID || PartyUInfo(empty) ||
+/// PartyVInfo(empty) || SuppPubInfo(key length in BITS, 4).
 fn concat_kdf(z: &[u8], alg: &[u8], length: usize) -> Vec<u8> {
     use sha2::{Digest, Sha256};
+    let key_bits = (length as u32) * 8;
     let mut out = Vec::with_capacity(length);
     let mut counter = 1u32;
     while out.len() < length {
@@ -1627,6 +1630,7 @@ fn concat_kdf(z: &[u8], alg: &[u8], length: usize) -> Vec<u8> {
         h.update(counter.to_be_bytes());
         h.update(z);
         h.update(alg);
+        h.update(key_bits.to_be_bytes());
         out.extend_from_slice(&h.finalize());
         counter += 1;
     }

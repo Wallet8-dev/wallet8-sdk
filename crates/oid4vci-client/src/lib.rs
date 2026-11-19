@@ -1072,6 +1072,7 @@ impl DpopSession {
                 endpoint,
                 access_token,
                 Some(serde_json::to_string(body).map_err(|e| e.to_string())?),
+                None,
             )
             .await?;
         if !status.is_success() {
@@ -1098,6 +1099,35 @@ impl DpopSession {
                 endpoint,
                 access_token,
                 Some(serde_json::to_string(body).map_err(|e| e.to_string())?),
+                None,
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(format!("protected call: HTTP {status}: {body_text}"));
+        }
+        Ok(body_text)
+    }
+
+    /// The protected call with a RAW body + explicit content-type -
+    /// the credential REQUEST's JWE form (a compact JWE is not JSON).
+    ///
+    /// # Errors
+    /// Transport + a non-2xx status after the retry.
+    pub async fn post_protected_raw(
+        &mut self,
+        http: &reqwest::Client,
+        endpoint: &str,
+        access_token: &str,
+        body: String,
+        content_type: &str,
+    ) -> Result<String, String> {
+        let (status, body_text, _) = self
+            .post_form_with_dpop_raw(
+                http,
+                endpoint,
+                access_token,
+                Some(body),
+                Some(content_type),
             )
             .await?;
         if !status.is_success() {
@@ -1124,6 +1154,7 @@ impl DpopSession {
                 endpoint,
                 access_token,
                 Some(serde_json::to_string(body).map_err(|e| e.to_string())?),
+                None,
             )
             .await?;
         if !status.is_success() {
@@ -1138,6 +1169,7 @@ impl DpopSession {
         endpoint: &str,
         access_token: &str,
         json_body: Option<String>,
+        content_type: Option<&str>,
     ) -> Result<(reqwest::StatusCode, String, Option<String>), String> {
         let mut attempt = 0;
         loop {
@@ -1158,7 +1190,8 @@ impl DpopSession {
                 .header("DPoP", proof)
                 .header("Authorization", format!("DPoP {access_token}"));
             if let Some(b) = &json_body {
-                req = req.header("Content-Type", "application/json").body(b.clone());
+                let ct = content_type.unwrap_or("application/json");
+                req = req.header("Content-Type", ct).body(b.clone());
             }
             let resp = req.send().await.map_err(|e| format!("dpop post: {e}"))?;
             let status = resp.status();

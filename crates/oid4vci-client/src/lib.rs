@@ -300,6 +300,11 @@ pub struct IssuerMetadata {
     /// wallet MUST encrypt (`encryption_required`).
     #[serde(default)]
     pub credential_response_encryption: Option<serde_json::Value>,
+    /// `credential_request_encryption` (§7.3, TOP-LEVEL since draft
+    /// 16): the issuer's REQUEST encryption key + the supported enc
+    /// families (the wallet seals the credential request to it).
+    #[serde(default)]
+    pub credential_request_encryption: Option<serde_json::Value>,
     /// `notification_endpoint` (OPTIONAL, §11).
     #[serde(default)]
     pub notification_endpoint: Option<String>,
@@ -1608,6 +1613,73 @@ fn ecdh_point(x_b64: &str, y_b64: &str) -> Result<p256::PublicKey, String> {
     p256::PublicKey::from_encoded_point(&encoded)
         .into_option()
         .ok_or_else(|| "the epk is not on the curve".into())
+}
+
+/// Seal a credential REQUEST as an ECDH-ES + A256GCM compact JWE to
+/// the issuer's advertised credential_request_encryption key (§8.2
+/// encrypted-request variant): the CEK = ECDH (the wallet's fresh
+/// ephemeral key) + ConcatKDF; the header carries the epk + kid.
+///
+/// # Errors
+/// The key parse or the AEAD seal.
+pub fn encrypt_request_ecdh_es_a256gcm(
+    payload: &serde_json::Value,
+    issuer_jwk: &serde_json::Value,
+    kid: Option<&str>,
+) -> Result<String, String> {
+    use aes_gcm::aead::{Aead, KeyInit};
+    let sk = p256::ecdsa::SigningKey::random(
+        &mut p256::ecdsa::signature::rand_core::OsRng,
+    );
+    let x = issuer_jwk.get("x").and_then(|v| v.as_str()).ok_or("no x")?;
+    let y = issuer_jwk.get("y").and_then(|v| v.as_str()).ok_or("no y")?;
+    let issuer_pk = ecdh_point(x, y)?;
+    let shared = p256::ecdh::diffie_hellman(
+        sk.as_nonzero_scalar(),
+        issuer_pk.as_affine(),
+    );
+    let cek = concat_kdf(shared.raw_secret_bytes(), b"A256GCM", 32);
+    // The epk = the WALLET's ephemeral public key (RFC 7518 §4.6).
+    let epk = device_key_jwk(&sk.verifying_key());
+    let mut header = serde_json::json!({ "alg": "ECDH-ES", "enc": "A256GCM", "epk": epk });
+    if let Some(k) = kid {
+        header["kid"] = serde_json::json!(k);
+    }
+    let header_json = serde_json::to_string(&header).map_err(|e| e.to_string())?;
+    let b64 = |b: &[u8]| {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+    };
+    let header_b64 = b64(header_json.as_bytes());
+    let nonce_bytes: [u8; 12] = rand_iv();
+    let key_bytes: [u8; 32] = cek[..32].try_into().map_err(|_| "cek length")?;
+    let cipher = aes_gcm::Aes256Gcm::new(&key_bytes.into());
+    let nonce: aes_gcm::Nonce<aes_gcm::aead::consts::U12> = nonce_bytes.into();
+    let plain = serde_json::to_vec(payload).map_err(|e| e.to_string())?;
+    let sealed = cipher
+        .encrypt(&nonce, aes_gcm::aead::Payload { msg: &plain, aad: header_b64.as_bytes() })
+        .map_err(|_| "the request JWE seal FAILED".to_string())?;
+    // Split the ct | tag (16).
+    if sealed.len() < 16 {
+        return Err("sealed too short".into());
+    }
+    let (ct, tag) = sealed.split_at(sealed.len() - 16);
+    Ok(format!(
+        "{header_b64}.{}.{}.{}.{}",
+        "",
+        b64(&nonce_bytes),
+        b64(ct),
+        b64(tag)
+    ))
+}
+
+/// A random 12-byte IV (OS entropy).
+fn rand_iv() -> [u8; 12] {
+    let mut iv = [0u8; 12];
+    // p256's re-exported rand_core OsRng fills it.
+    use p256::ecdsa::signature::rand_core::RngCore;
+    p256::ecdsa::signature::rand_core::OsRng.fill_bytes(&mut iv);
+    iv
 }
 
 /// Standard base64url decode (no padding requirement).

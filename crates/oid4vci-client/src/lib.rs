@@ -323,6 +323,11 @@ pub struct AsMetadata {
     /// `pushed_authorization_request_endpoint` (RFC 9126).
     #[serde(default)]
     pub pushed_authorization_request_endpoint: Option<String>,
+    /// `challenge_endpoint` (HAIP): when advertised, the client MUST GET
+    /// a fresh attestation challenge before EVERY client-attestation
+    /// protected endpoint and echo it in the PoP `challenge` claim.
+    #[serde(default)]
+    pub challenge_endpoint: Option<String>,
     /// `pre-authorized_grant_anonymous_access_supported` (§12.3):
     /// true = the pre-authorized token request carries NO client_id.
     #[serde(default)]
@@ -378,6 +383,41 @@ pub async fn resolve_as_metadata(
     let base = as_identifier.trim_end_matches('/');
     let url = format!("{base}/.well-known/oauth-authorization-server");
     fetch_as_metadata(http, &url).await
+}
+
+/// Fetch a fresh attestation challenge from the AS's advertised
+/// `challenge_endpoint` (HAIP): a POST with an empty body (the suite's
+/// mock + the HAIP draft require POST). The response body is either
+/// `{ "attestation_challenge": "..." }` or a bare string.
+///
+/// # Errors
+/// Transport + parse failures or a non-2xx status.
+pub async fn fetch_attestation_challenge(
+    http: &reqwest::Client,
+    challenge_endpoint: &str,
+) -> Result<String, String> {
+    let resp = http
+        .post(challenge_endpoint)
+        .send()
+        .await
+        .map_err(|e| format!("challenge fetch: {e}"))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("challenge read: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("challenge endpoint: HTTP {status}"));
+    }
+    let value: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("challenge parse: {e}"))?;
+    if let Some(c) = value.get("attestation_challenge").and_then(|v| v.as_str()) {
+        return Ok(c.to_string());
+    }
+    if let Some(c) = value.as_str() {
+        return Ok(c.to_string());
+    }
+    Err("challenge endpoint: no attestation_challenge in the response".into())
 }
 
 /// Fetch the issuer metadata from an EXPLICIT URL (the conformance
@@ -1030,6 +1070,32 @@ impl DpopSession {
         serde_json::from_str(&body_text).map_err(|e| format!("protected parse: {e}"))
     }
 
+    /// The same protected call, returning the RAW body text - the
+    /// credential endpoint's JWE response form is not JSON.
+    ///
+    /// # Errors
+    /// Transport + a non-2xx status after the retry.
+    pub async fn post_protected_text(
+        &mut self,
+        http: &reqwest::Client,
+        endpoint: &str,
+        access_token: &str,
+        body: &serde_json::Value,
+    ) -> Result<String, String> {
+        let (status, body_text, _) = self
+            .post_form_with_dpop_raw(
+                http,
+                endpoint,
+                access_token,
+                Some(serde_json::to_string(body).map_err(|e| e.to_string())?),
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(format!("protected call: HTTP {status}: {body_text}"));
+        }
+        Ok(body_text)
+    }
+
     /// The fire-and-forget protected call (§11 notifications): the
     /// same DPoP binding; the HTTP status decides.
     ///
@@ -1423,6 +1489,130 @@ impl serde::Serialize for CredentialRequestBody {
     }
 }
 
+/// The credential-response encryption material (§8.2): the wallet's
+/// EPHEMERAL P-256 key - the request carries the public JWK + the
+/// alg/enc; the issuer wraps the response as a JWE the wallet opens.
+pub struct ResponseEncryption {
+    /// The ephemeral private key (the ECDH shared secret side).
+    pub sk: p256::ecdsa::SigningKey,
+    /// The public JWK form (RFC 7517) the request carries.
+    pub jwk: serde_json::Value,
+    /// The advertised alg (ECDH-ES = direct CEK agreement).
+    pub alg: &'static str,
+    /// The advertised enc (A256GCM).
+    pub enc: &'static str,
+}
+
+/// Mint the response-encryption material: a fresh P-256 key + its JWK.
+pub fn mint_response_encryption() -> ResponseEncryption {
+    let sk = p256::ecdsa::SigningKey::random(&mut p256::ecdsa::signature::rand_core::OsRng);
+    let jwk = device_key_jwk(&sk.verifying_key());
+    ResponseEncryption {
+        sk,
+        jwk,
+        alg: "ECDH-ES",
+        enc: "A256GCM",
+    }
+}
+
+/// Open an ECDH-ES + A256GCM JWE (the 5-part compact form) with the
+/// wallet's ephemeral key.
+///
+/// # Errors
+/// Malformed JWE, an unexpected alg/enc, or an AEAD failure.
+pub fn decrypt_ecdh_es_a256gcm(
+    jwe: &str,
+    sk: &p256::ecdsa::SigningKey,
+) -> Result<serde_json::Value, String> {
+    use aes_gcm::aead::{Aead, KeyInit};
+    use p256::ecdsa::signature::rand_core::OsRng as _OsRngUnused;
+    let _ = _OsRngUnused;
+    let parts: Vec<&str> = jwe.split('.').collect();
+    if parts.len() != 5 {
+        return Err(format!("the JWE carries {} parts (want 5)", parts.len()));
+    }
+    let header = b64d(parts[0])?;
+    let header_v: serde_json::Value = serde_json::from_slice(&header)
+        .map_err(|e| format!("jwe header parse: {e}"))?;
+    let alg = header_v.get("alg").and_then(|v| v.as_str()).unwrap_or("");
+    let enc = header_v.get("enc").and_then(|v| v.as_str()).unwrap_or("");
+    if alg != "ECDH-ES" || enc != "A256GCM" {
+        return Err(format!("unsupported JWE alg/enc {alg}/{enc}"));
+    }
+    let epk = header_v
+        .get("epk")
+        .and_then(|v| v.get("x"))
+        .and_then(|x| x.as_str())
+        .ok_or("no epk.x in the JWE header")?;
+    let epk_y = header_v
+        .get("epk")
+        .and_then(|v| v.get("y"))
+        .and_then(|y| y.as_str())
+        .ok_or("no epk.y in the JWE header")?;
+    let sender_pk = ecdh_point(epk, epk_y)?;
+    let shared = p256::ecdh::diffie_hellman(
+        sk.as_nonzero_scalar(),
+        sender_pk.as_affine(),
+    );
+    // ConcatKDF (NIST SP 800-56A §5.8.1) as a single round: the alg
+    // header + the ASCII secret + the 32-byte length marker.
+    let cek = concat_kdf(shared.raw_secret_bytes(), b"A256GCM", 32);
+    let iv = b64d(parts[2])?;
+    let ct_tag = b64d(parts[3])?;
+    let tag = b64d(parts[4])?;
+    let mut ciphertext = ct_tag;
+    ciphertext.extend_from_slice(&tag);
+    let aad = parts[0].as_bytes();
+    let key_bytes: [u8; 32] = cek[..32].try_into().map_err(|_| "cek length".to_string())?;
+    let cipher = aes_gcm::Aes256Gcm::new(&key_bytes.into());
+    let mut nonce_buf = [0u8; 12];
+    nonce_buf.copy_from_slice(&iv[..12.min(iv.len())]);
+    let nonce: aes_gcm::Nonce<aes_gcm::aead::consts::U12> = nonce_buf.into();
+    let plain = cipher
+        .decrypt(&nonce, aes_gcm::aead::Payload { msg: &ciphertext, aad })
+        .map_err(|_| "the JWE AEAD verification FAILED".to_string())?;
+    serde_json::from_slice(&plain).map_err(|e| format!("jwe payload parse: {e}"))
+}
+
+/// The NIST ConcatKDF for the CEK derivation (one round; SHA-256).
+fn concat_kdf(z: &[u8], alg: &[u8], length: usize) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut out = Vec::with_capacity(length);
+    let mut counter = 1u32;
+    while out.len() < length {
+        let mut h = Sha256::new();
+        h.update(counter.to_be_bytes());
+        h.update(z);
+        h.update(alg);
+        out.extend_from_slice(&h.finalize());
+        counter += 1;
+    }
+    out.truncate(length);
+    out
+}
+
+/// Rebuild the sender's public key from its JWK x/y (base64url).
+fn ecdh_point(x_b64: &str, y_b64: &str) -> Result<p256::PublicKey, String> {
+    use p256::elliptic_curve::sec1::FromEncodedPoint;
+    let x = b64d(x_b64)?;
+    let y = b64d(y_b64)?;
+    let mut point = vec![0x04];
+    point.extend_from_slice(&x);
+    point.extend_from_slice(&y);
+    let encoded = p256::EncodedPoint::from_bytes(&point).map_err(|_| "bad epk POINT".to_string())?;
+    p256::PublicKey::from_encoded_point(&encoded)
+        .into_option()
+        .ok_or_else(|| "the epk is not on the curve".into())
+}
+
+/// Standard base64url decode (no padding requirement).
+fn b64d(s: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s)
+        .map_err(|e| format!("b64url decode: {e}"))
+}
+
 /// Decode a Credential Response value (§8.3) into the enum the
 /// request path returns - the shared form the DpopSession-protected
 /// call and the plain call both land on.
@@ -1505,11 +1695,19 @@ pub enum CredentialResponse {
 /// `invalid_credential_request`, `unknown_credential_configuration`,
 /// `unknown_credential_identifier`, `invalid_proof`, `invalid_nonce`,
 /// `invalid_encryption_parameters`, `credential_request_denied`).
+/// Perform the credential request (§8.2) and decode the response -
+/// the JSON form or a compact JWE (when the request carried the
+/// encryption material, the issuer MAY return the 5-part JWE; the
+/// wallet opens it with its ephemeral key).
+///
+/// # Errors
+/// Transport, HTTP, parse, or the error envelope.
 pub async fn request_credential(
     http: &reqwest::Client,
     credential_endpoint: &str,
     access_token: &str,
     body: &CredentialRequestBody,
+    encryption: Option<&ResponseEncryption>,
 ) -> Result<CredentialResponse, String> {
     let resp = http
         .post(credential_endpoint)
@@ -1526,8 +1724,18 @@ pub async fn request_credential(
     if !status.is_success() {
         return Err(format!("credential request: HTTP {status}: {text}"));
     }
-    let v: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("credential response parse: {e}"))?;
+    let v: serde_json::Value = if text.trim_start().starts_with('{') {
+        serde_json::from_str(&text).map_err(|e| format!("credential response parse: {e}"))?
+    } else if text.split('.').count() == 5 {
+        let enc = encryption
+            .ok_or("the JWE response arrived but the request carried no encryption material")?;
+        decrypt_ecdh_es_a256gcm(text.trim(), &enc.sk)?
+    } else {
+        return Err(format!(
+            "credential response is neither JSON nor a JWE ({} chars)",
+            text.len()
+        ));
+    };
     if let Some(creds) = v.get("credentials").and_then(|c| c.as_array()) {
         let mut out = Vec::new();
         for entry in creds {

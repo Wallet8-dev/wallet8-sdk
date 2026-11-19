@@ -1617,20 +1617,32 @@ pub fn decrypt_ecdh_es_a256gcm(
     serde_json::from_slice(&plain).map_err(|e| format!("jwe payload parse: {e}"))
 }
 
-/// The NIST SP 800-56A §5.8.1 ConcatKDF - the JWA ECDH-ES form:
-/// Counter(4) || Z || AlgorithmID || PartyUInfo(empty) ||
-/// PartyVInfo(empty) || SuppPubInfo(key length in BITS, 4).
+/// The NIST SP 800-56A §5.8.1 ConcatKDF - the JWA ECDH-ES form (ref:
+/// jwcrypto `_EcdhEs._derive`):
+/// Counter(4) || Z || len4(AlgorithmID) || AlgorithmID || len4(apu) ||
+/// apu || len4(apv) || apv || SuppPubInfo(4, the key length in BITS).
 fn concat_kdf(z: &[u8], alg: &[u8], length: usize) -> Vec<u8> {
     use sha2::{Digest, Sha256};
-    let key_bits = (length as u32) * 8;
+    let mut otherinfo = {
+        let mut v = Vec::new();
+        v.extend_from_slice(&(alg.len() as u32).to_be_bytes());
+        v.extend_from_slice(alg);
+        // PartyUInfo: EMPTY (0u32)
+        v.extend_from_slice(&0u32.to_be_bytes());
+        // PartyVInfo: EMPTY (0u32)
+        v.extend_from_slice(&0u32.to_be_bytes());
+        // SuppPubInfo: the key length in bits
+        v.extend_from_slice(&((length as u32) * 8).to_be_bytes());
+        v
+    };
+    let _ = &mut otherinfo;
     let mut out = Vec::with_capacity(length);
     let mut counter = 1u32;
     while out.len() < length {
         let mut h = Sha256::new();
         h.update(counter.to_be_bytes());
         h.update(z);
-        h.update(alg);
-        h.update(key_bits.to_be_bytes());
+        h.update(&otherinfo);
         out.extend_from_slice(&h.finalize());
         counter += 1;
     }

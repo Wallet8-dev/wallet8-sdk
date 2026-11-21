@@ -76,18 +76,25 @@ fn recipient_jwk(client_metadata: &Value) -> Result<Value, EncryptionError> {
         .pointer("/jwks/keys")
         .and_then(|k| k.as_array())
         .filter(|k| !k.is_empty())
-        .ok_or_else(|| EncryptionError("the client_metadata carries no jwks keys (§8.3)".into()))?;
+        .ok_or_else(|| EncryptionError("the client_metadata carries no jwks keys".into()))?;
     for key in keys {
+        // The `use` filter: an EXPLICIT use=sig disqualifies the key
+        // (RFC 7517 4.2); an ABSENT use = unrestricted (RFC 7517
+        // 4.3) - the verifier's metadata MAY omit it (the suite's
+        // WithoutUseEnc mint variant does exactly that).
         let use_ = key.get("use").and_then(|v| v.as_str()).unwrap_or("");
+        if use_ == "sig" {
+            continue;
+        }
         let kty = key.get("kty").and_then(|v| v.as_str()).unwrap_or("");
         let crv = key.get("crv").and_then(|v| v.as_str()).unwrap_or("");
         let alg = key.get("alg").and_then(|v| v.as_str()).unwrap_or("ECDH-ES");
-        if use_ == "enc" && kty == "EC" && crv == "P-256" && alg == "ECDH-ES" {
+        if kty == "EC" && crv == "P-256" && alg == "ECDH-ES" {
             return Ok(key.clone());
         }
     }
     Err(EncryptionError(
-        "no EC P-256 ECDH-ES encryption key in the verifier metadata (§8.3)".into(),
+        "no EC P-256 ECDH-ES encryption key in the verifier metadata".into(),
     ))
 }
 
@@ -123,6 +130,9 @@ fn concat_cek(
 ) -> Vec<u8> {
     use sha2::Digest;
     let algorithm_id = enc.as_bytes().to_vec();
+    // RFC 7518 §4.6.1: SuppPubInfo carries the KEY LENGTH IN BITS
+    // (uint32) - bytes here breaks every nimbus-side decrypt (the
+    // conformance suite's DecryptResponse lands Tag mismatch).
     let mut info = Vec::new();
     info.extend_from_slice(&(algorithm_id.len() as u32).to_be_bytes());
     info.extend_from_slice(&algorithm_id);
@@ -130,13 +140,17 @@ fn concat_cek(
     info.extend_from_slice(apu);
     info.extend_from_slice(&(apv.len() as u32).to_be_bytes());
     info.extend_from_slice(apv);
-    info.extend_from_slice(&(key_len as u32).to_be_bytes());
+    info.extend_from_slice(&((key_len * 8) as u32).to_be_bytes());
     let mut out = Vec::new();
+    // RFC 7518 §4.6.1: H(counter || Z || OtherInfo) - the 4-byte
+    // iteration counter comes FIRST, then the shared secret, then
+    // OtherInfo (the platform's earlier shared||counter form broke
+    // every nimbus-side decrypt with Tag mismatch).
     let mut counter: u32 = 1;
     while out.len() < key_len {
         let mut block = Vec::with_capacity(shared.len() + info.len() + 4);
-        block.extend_from_slice(shared);
         block.extend_from_slice(&counter.to_be_bytes());
+        block.extend_from_slice(shared);
         block.extend_from_slice(&info);
         let digest = sha2::Sha256::digest(&block);
         out.extend_from_slice(&digest);
@@ -200,6 +214,9 @@ pub fn encrypt_response_alg(
     let recipient = recipient_jwk(client_metadata)?;
     let enc = select_enc(client_metadata);
     let public = jwk_to_p256(&recipient)?;
+    // The recipient's kid rides the protected header (RFC 7516 4.1.4;
+    // the verifier's DecryptResponse selects THIS key by kid).
+    let recipient_kid = recipient.get("kid").and_then(|v| v.as_str()).map(str::to_owned);
     // The ephemeral key pair (the wallet's side of the agreement).
     let epk_secret =
         p256::elliptic_curve::ecdh::EphemeralSecret::<p256::NistP256>::random(
@@ -214,13 +231,16 @@ pub fn encrypt_response_alg(
     // Party descriptors: absent → zero-length (the platform's form).
     let apu: Vec<u8> = Vec::new();
     let apv: Vec<u8> = Vec::new();
-    let protected = serde_json::json!({
+    let mut protected = serde_json::json!({
         "alg": alg,
         "enc": enc,
         "epk": epk,
         "apu": b64u(&apu),
         "apv": b64u(&apv),
     });
+    if let Some(kid) = recipient_kid {
+        protected["kid"] = serde_json::json!(kid);
+    }
     let protected_json = protected.to_string();
     let protected_b64 = b64u(protected_json.as_bytes());
     // ECDH: the shared secret derives the CEK via the ConcatKDF.

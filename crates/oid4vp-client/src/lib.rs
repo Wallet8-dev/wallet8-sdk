@@ -59,7 +59,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod verification;
-pub use verification::{verify_request_object, VerificationError, Verified, VerifierTrust};
+pub use verification::{verify_request_object, verify_request_object_value, VerificationError, Verified, VerifierTrust};
 
 pub mod encryption;
 pub use encryption::{encrypt_response, EncryptionError};
@@ -119,13 +119,38 @@ pub struct AuthorizationRequest {
     pub transaction_data: Vec<String>,
     /// The `verifier_info` attestations (§5.11 - MAY enrich consent;
     /// ignored when unsupported).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "verifier_info_flexible")]
     pub verifier_info: Vec<serde_json::Value>,
     /// The `expected_origins` (App. A.2: REQUIRED for signed DC API
     /// requests; the wallet MUST compare against the platform-provided
     /// Origin).
     #[serde(default)]
     pub expected_origins: Vec<String>,
+}
+
+/// Deserialize `verifier_info` in either shape the ecosystem emits.
+///
+/// The spec form (§5.1) is a non-empty array of attestation objects;
+/// the OIDF certification suite's verifier builder instead copies its
+/// client-block member VERBATIM, which yields the single object form
+/// (`{"name": ..., "purpose": ...}`). §5.11 never lets this member
+/// fail the request - a Wallet MAY use the attestations, and SHOULD
+/// ignore unrecognized/unsupported entries - so a malformed member
+/// deserializes as EMPTY, never as a parse error (the 422
+/// `invalid type: map, expected a sequence` regression this fixes).
+///
+/// # Errors
+/// Never (any shape maps to 0 or 1 entries).
+fn verifier_info_flexible<'de, D>(deserializer: D) -> Result<Vec<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(deserializer)?;
+    match v {
+        serde_json::Value::Array(items) => Ok(items),
+        obj @ serde_json::Value::Object(_) => Ok(vec![obj]),
+        _ => Ok(vec![]),
+    }
 }
 
 /// Parse the request-object payload (§5.4).
@@ -149,31 +174,31 @@ pub fn parse_request(payload: &str) -> Result<AuthorizationRequest, String> {
 /// `invalid_request` family).
 pub fn check_request_shape(request: &AuthorizationRequest) -> Result<(), String> {
     if request.nonce.is_empty() {
-        return Err("the request carries no nonce (§5.2 REQUIRED)".into());
+        return Err("the request carries no nonce".into());
     }
     // §8.4 + §5.1: the wallet does not support transaction_data - a
     // request carrying it MUST reject, never a partial pass.
     if !request.transaction_data.is_empty() {
         return Err(
-            "the request carries transaction_data the wallet does not support (§5.1)".into(),
+            "the request carries transaction_data the wallet does not support".into(),
         );
     }
     match (&request.dcql_query, &request.scope) {
         (Some(_), Some(_)) => {
-            return Err("the request carries both dcql_query and scope (§5.1)".into())
+            return Err("the request carries both dcql_query and scope".into())
         }
         (None, None) => {
-            return Err("the request carries neither dcql_query nor a scope alias (§5.1)".into())
+            return Err("the request carries neither dcql_query nor a scope alias".into())
         }
         _ => {}
     }
     match request.response_mode.as_deref() {
         Some("direct_post") | Some("direct_post.jwt") => {
             if request.response_uri.is_none() {
-                return Err("direct_post requires a response_uri (§8.2)".into());
+                return Err("direct_post requires a response_uri".into());
             }
             if request.redirect_uri.is_some() {
-                return Err("response_uri and redirect_uri are exclusive (§8.2)".into());
+                return Err("response_uri and redirect_uri are exclusive".into());
             }
         }
         Some("dc_api") | Some("dc_api.jwt") | None | Some("fragment") => {}
@@ -234,14 +259,14 @@ pub fn resolve_scope_alias(
     for alias in scope.split_whitespace() {
         let Some(mapped) = registry.get(alias) else {
             return Err(format!(
-                "the scope value {alias:?} maps to no DCQL query the wallet defines (§5.5)"
+                "the scope value {alias:?} maps to no DCQL query the wallet defines"
             ));
         };
         query.credentials.extend(mapped.credentials.iter().cloned());
         query.credential_sets.extend(mapped.credential_sets.iter().cloned());
     }
     if query.credentials.is_empty() {
-        return Err("the scope resolved to no credential queries (§5.5)".into());
+        return Err("the scope resolved to no credential queries".into());
     }
     resolved.dcql_query = Some(query);
     Ok(resolved)
@@ -394,7 +419,7 @@ pub fn evaluate_dcql<'a>(
         for q in &query.credentials {
             if !match_for(q, &mut matches)? {
                 return Err(format!(
-                    "no credential satisfies the required query {} (§6.4.2)",
+                    "no credential satisfies the required query {}",
                     q.id
                 ));
             }
@@ -441,7 +466,7 @@ pub fn evaluate_dcql<'a>(
         }
         if !satisfied && set.required {
             return Err(
-                "a required credential set is unsatisfiable (§6.4.2)".into(),
+                "a required credential set is unsatisfiable".into(),
             );
         }
     }
@@ -557,7 +582,7 @@ fn select_claims(
             return Ok(paths);
         }
     }
-    Err("no claim_set option is satisfiable (§6.4.1)".into())
+    Err("no claim_set option is satisfiable".into())
 }
 
 fn path_key(path: &[serde_json::Value]) -> String {
@@ -635,13 +660,22 @@ fn mdoc_entry(
     dc_api_origin: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let encryption_thumbprint = response_encryption_thumbprint(request)?;
-    let transcript = match dc_api_origin {
-        Some(origin) => sentin8::mdoc::dc_api_transcript(
+    // The transcript follows the RESPONSE MODE (B.2.6.1 vs B.2.6.2) -
+    // NOT the presence of a platform origin (a dc_api-style origin
+    // rides along on direct_post rows too; the browser-origin context
+    // is informational there).
+    let dc_api_mode = request
+        .response_mode
+        .as_deref()
+        .map(|m| m.starts_with("dc_api"))
+        .unwrap_or(false);
+    let transcript = match (dc_api_mode, dc_api_origin) {
+        (true, Some(origin)) => sentin8::mdoc::dc_api_transcript(
             origin,
             &request.nonce,
             encryption_thumbprint.as_deref(),
         )?,
-        None => {
+        _ => {
             let response_uri = request
                 .response_uri
                 .as_deref()
@@ -655,13 +689,47 @@ fn mdoc_entry(
             )?
         }
     };
+    // OID4VP 6.4.1: the wallet releases ONLY the claims the DCQL query
+    // reaches - the mdoc IssuerSignedItems are filtered to the selected
+    // claim paths ([namespace, elementIdentifier] for mSO_mdoc claims)
+    // before the DeviceResponse is built (dropping an item is legal:
+    // the MSO digest coverage is per item). A claims-LESS DCQL query
+    // ("the wallet MUST NOT disclose anything selectively disclosable")
+    // produces an EMPTY selected-claim set - here the allowlist must
+    // match NOTHING (the all-claims presentation is the 6.4.1 violation
+    // the suite's CheckOnlyRequestedMdocElementsDisclosed rejects), not
+    // everything, so a single no-match entry keeps every namespace out.
+    let no_claims_requested = m.query.claims.is_empty();
+    let mut allowlist: sentin8::mdoc::ClaimAllowlist = m
+        .selected_claim_paths
+        .iter()
+        .filter_map(|path| {
+            let ns = path.first()?.as_str()?;
+            let elem = path.get(1)?.as_str()?;
+            Some((ns.to_string(), elem.to_string()))
+        })
+        .collect();
+    if no_claims_requested {
+        // The impossible allowlist: every IssuerSignedItem is dropped
+        // (the nameSpaces member then carries empty arrays and the
+        // presentation discloses only the MSO + deviceSignature).
+        allowlist.clear();
+        allowlist.push((
+            "oid4vp-6.4.1-no-claims-disclose-nothing".to_string(),
+            "-".to_string(),
+        ));
+    }
+    let issuer_signed_b64 = sentin8::mdoc::filter_issuer_signed(
+        &m.credential.credential,
+        &allowlist,
+    )?;
     let input = sentin8::mdoc::DeviceResponseInput {
         doc_type: m
             .credential
             .doctype
             .as_deref()
             .ok_or("an mdoc holding without a doctype")?,
-        issuer_signed_b64: &m.credential.credential,
+        issuer_signed_b64: &issuer_signed_b64,
         device_key,
         transcript: &transcript,
     };
@@ -685,13 +753,28 @@ fn response_encryption_thumbprint(
         return Ok(None);
     };
     // The Verifier's encryption JWK (§8.3: the alg/enc selection).
+    // The use member is OPTIONAL - a JWK without `use` (the suite's
+    // AddVP1FinalEncryptionParametersToClientMetadataWithoutUseEnc shape)
+    // is still a response-encryption key as long as its alg is a key-
+    // agreement/encryption alg or kty is EC (the RFC 7638 thumbprint the
+    // B.2.6.x handover digests). Requiring `use:"enc"` dropped it and the
+    // holder fell back to the UNENCRYPTED handover while the verifier
+    // hashed the ENCRYPTED one - the session transcripts diverged.
     let mut candidates: Vec<&serde_json::Value> = keys
         .iter()
         .filter(|k| {
-            k.get("use")
+            let use_ok = k
+                .get("use")
                 .and_then(|u| u.as_str())
                 .map(|u| u == "enc")
-                .unwrap_or(false)
+                .unwrap_or(true);
+            let kty = k.get("kty").and_then(|t| t.as_str()).unwrap_or("");
+            let alg_ok = k
+                .get("alg")
+                .and_then(|a| a.as_str())
+                .map(|a| a.starts_with("ECDH") || a.starts_with("RSA-OAEP") || a == "ECDH-ES+A128KW")
+                .unwrap_or(true);
+            use_ok && kty == "EC" && alg_ok
         })
         .collect();
     if candidates.is_empty() {
@@ -702,23 +785,219 @@ fn response_encryption_thumbprint(
     Ok(Some(thumbprint.to_vec()))
 }
 
-/// The SD-JWT presentation (B.3.6): the SD-JWT + KB-JWT chain.
+/// The SD-JWT presentation (B.3.6 + 6.4.1): the SD-JWT with ONLY the
+/// DCQL-selected disclosures + the KB-JWT chain. 6.4.1: "wallets MUST
+/// NOT send selectively disclosable claims that have not been
+/// selected" - the filter keeps the issuer's signature intact and
+/// releases exactly the disclosures the selected claim paths reach
+/// (object members by name, array elements by index, subobjects by
+/// their nested paths). The KB `sd_hash` covers the FILTERED form.
 fn sd_jwt_entry(
     m: &DcqlMatch,
     device_key: &p256::ecdsa::SigningKey,
     request: &AuthorizationRequest,
     dc_api_origin: Option<&str>,
 ) -> Result<serde_json::Value, String> {
+    let filtered = filter_sd_jwt(&m.credential.credential, &m.selected_claim_paths)?;
     let kb = mint_kb_jwt(
         device_key,
         &request.nonce,
         &binding_audience(&request.client_id, dc_api_origin),
-        &m.credential.credential,
+        &filtered,
     )?;
+    // The compact SD-JWT chain: <issuance>~<d1>~...~<dk>~<kb-jwt> - the
+    // KB rides AFTER a tilde whether or not disclosures precede it.
+    // (mint_kb_jwt hashes its input + a trailing '~': the separator
+    // tilde before the KB is PART of the SD-JWT the sd_hash covers.)
     Ok(serde_json::Value::String(format!(
-        "{}{}",
-        m.credential.credential, kb
+        "{}~{}",
+        filtered.trim_end_matches('~'), kb
     )))
+}
+
+/// One parsed SD-JWT disclosure: the digest position (salt, name, the
+/// JSON value it reveals) + the base64url form it rides in.
+#[derive(Clone)]
+struct Disclosure {
+    /// The digest this disclosure satisfies (base64url, as the `_sd`
+    /// entries carry it).
+    digest: String,
+    /// The claim name (object members) - None for array elements.
+    name: Option<String>,
+    /// The value the disclosure reveals (with any nested `_sd` intact).
+    value: serde_json::Value,
+}
+
+/// Parse an SD-JWT compact form into (issuance, disclosures).
+fn parse_sd_jwt_disclosures(sd_jwt: &str) -> Result<(String, Vec<Disclosure>), String> {
+    use base64::Engine;
+    use sha2::Digest as _;
+    let b64d = |s: &str| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(s)
+            .map_err(|e| format!("the SD-JWT segment decode: {e}"))
+    };
+    let mut parts = sd_jwt.split('~');
+    let issuance = parts.next().unwrap_or("").to_string();
+    let mut disclosures = Vec::new();
+    for part in parts {
+        if part.is_empty() {
+            continue;
+        }
+        let digest = {
+            let mut h = sha2::Sha256::new();
+            h.update(part.as_bytes());
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(h.finalize())
+        };
+        let raw = b64d(part)?;
+        let arr: Vec<serde_json::Value> = serde_json::from_slice(&raw)
+            .map_err(|e| format!("the disclosure decode: {e}"))?;
+        // [salt, name, value] = object member; [salt, value] = array
+        // element (the value may carry nested _sd objects).
+        let (name, value) = match arr.len() {
+            3 => (Some(arr[1].as_str().unwrap_or("").to_string()), arr[2].clone()),
+            2 => (None, arr[1].clone()),
+            other => return Err(format!("the disclosure carries {other} elements")),
+        };
+        disclosures.push(Disclosure { digest, name, value });
+    }
+    Ok((issuance, disclosures))
+}
+
+/// Walk the payload tree collecting the disclosure digests the selected
+/// paths reach (name match at objects, index at arrays; a Null segment
+/// = any array element / any object member).
+fn collect_required_disclosures(
+    payload: &serde_json::Value,
+    disclosures: &[Disclosure],
+    selected_paths: &[Vec<serde_json::Value>],
+) -> std::collections::HashSet<String> {
+    let by_digest: std::collections::HashMap<&str, &Disclosure> = disclosures
+        .iter()
+        .map(|d| (d.digest.as_str(), d))
+        .collect();
+    let mut keep = std::collections::HashSet::new();
+    for path in selected_paths {
+        collect_path(payload, path, disclosures, &by_digest, &mut keep);
+    }
+    keep
+}
+
+/// The single-path walk: the current node + the remaining segments.
+fn collect_path(
+    node: &serde_json::Value,
+    rest: &[serde_json::Value],
+    disclosures: &[Disclosure],
+    by_digest: &std::collections::HashMap<&str, &Disclosure>,
+    keep: &mut std::collections::HashSet<String>,
+) {
+    if rest.is_empty() {
+        return;
+    }
+    match node {
+        serde_json::Value::Object(map) => {
+            let sds = map.get("_sd").and_then(|v| v.as_array());
+            if let Some(sds) = sds {
+                let head = &rest[0];
+                let head_name = head.as_str();
+                for digest in sds {
+                    let Some(digest) = digest.as_str() else { continue };
+                    let Some(d) = by_digest.get(digest) else { continue };
+                    match (d.name.as_deref(), head_name) {
+                        (Some(n), Some(h)) if n == h => {
+                            keep.insert(digest.to_string());
+                            collect_path(&d.value, &rest[1..], disclosures, by_digest, keep);
+                        }
+                        (Some(_), None) => {
+                            keep.insert(digest.to_string());
+                            collect_path(&d.value, rest, disclosures, by_digest, keep);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // Non-selective members: descend for nested selective subs.
+            if let Some(head) = rest[0].as_str() {
+                if let Some(child) = map.get(head) {
+                    collect_path(child, &rest[1..], disclosures, by_digest, keep);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (pos, item) in items.iter().enumerate() {
+                // Array-element digests ride {"...": digest} objects
+                // (the selective-disclosure array placeholder).
+                if let Some(digest) = item
+                    .get("...")
+                    .or_else(|| item.get("."))
+                    .and_then(|v| v.as_str())
+                {
+                    let Some(d) = by_digest.get(digest) else { continue };
+                    let head = &rest[0];
+                    let reveal = match head.as_u64() {
+                        Some(i) => pos as u64 == i,
+                        None => true,
+                    };
+                    if reveal {
+                        keep.insert(digest.to_string());
+                        collect_path(&d.value, &rest[1..], disclosures, by_digest, keep);
+                    }
+                } else {
+                    collect_path(item, rest, disclosures, by_digest, keep);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The selective-disclosure filter (6.4.1): the SD-JWT keeps its
+/// issuance + ONLY the disclosures the selected paths reach.
+fn filter_sd_jwt(
+    sd_jwt: &str,
+    selected_paths: &[Vec<serde_json::Value>],
+) -> Result<String, String> {
+    let (issuance, disclosures) = parse_sd_jwt_disclosures(sd_jwt)?;
+    if disclosures.is_empty() {
+        // No selective disclosure in the credential - present as issued.
+        return Ok(sd_jwt.trim_end_matches('~').to_string());
+    }
+    if selected_paths.is_empty() {
+        // NO claims requested (6.4.1): the wallet returns ONLY the
+        // mandatory (non-selectively-disclosable) claims - the issuance
+        // alone, no disclosures.
+        return Ok(issuance);
+    }
+    let payload_raw = issuance
+        .split('.')
+        .nth(1)
+        .ok_or("the SD-JWT carries no payload")?;
+    use base64::Engine;
+    let payload: serde_json::Value = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload_raw)
+            .map_err(|e| format!("the sd-jwt payload decode: {e}"))?,
+    )
+    .map_err(|e| format!("the sd-jwt payload parse: {e}"))?;
+    let keep = collect_required_disclosures(&payload, &disclosures, selected_paths);
+    let kept_parts: Vec<&str> = sd_jwt
+        .split('~')
+        .skip(1)
+        .filter(|p| {
+            if p.is_empty() {
+                return false;
+            }
+            let digest = {
+                use sha2::Digest as _;
+                let mut h = sha2::Sha256::new();
+                h.update(p.as_bytes());
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(h.finalize())
+            };
+            keep.contains(&digest)
+        })
+        .collect();
+    Ok(format!("{}~{}", issuance, kept_parts.join("~")))
 }
 
 /// The Key Binding JWT (B.3.6): header `{"alg": "ES256", "typ":
@@ -737,7 +1016,12 @@ pub fn mint_kb_jwt(
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
     };
     let header = b64(br#"{"alg":"ES256","typ":"kb+jwt"}"#.as_slice());
-    let sd_hash = b64(&sha2::Sha256::digest(sd_jwt.as_bytes()));
+    // The sd_hash boundary: the SD-JWT string INCLUDES the trailing
+    // tilde that separates it from the KB-JWT (the SD-JWT spec's
+    // 6th-part structure - the verifier recomputes over the same
+    // bytes, a missing tilde mismatches).
+    let hashed = format!("{}~", sd_jwt.trim_end_matches('~'));
+    let sd_hash = b64(&sha2::Sha256::digest(hashed.as_bytes()));
 
     let payload = serde_json::json!({
         "nonce": nonce,
@@ -749,6 +1033,160 @@ pub fn mint_kb_jwt(
     let signing_input = format!("{header}.{claims}");
     let sig: p256::ecdsa::Signature = device_key.sign(signing_input.as_bytes());
     Ok(format!("{signing_input}.{}", b64(&sig.to_bytes())))
+}
+
+/// The selected claim paths a credential DOES NOT carry (the 6.4.1
+/// gate the response-side rule needs): for each match, one flat string
+/// per selected path that resolves to nothing in the holding's
+/// flattened claim keys.
+///
+/// # Examples
+///
+/// ```
+/// use wallet8_oid4vp_client::{DcqlQuery, evaluate_dcql, find_unsatisfied_claim_paths, WalletCredential};
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let query: DcqlQuery = serde_json::from_value(serde_json::json!({
+///     "credentials": [{"id": "q1", "format": "dc+sd-jwt",
+///         "meta": {}, "claims": [{"id": "c1", "path": ["given_name"]}]}]
+/// }))?;
+/// let holding = WalletCredential {
+///     format: "dc+sd-jwt".into(), doctype: None, vct: None,
+///     credential: "abc".into(),
+///     claim_values: [("given_name".to_string(), serde_json::json!("Jean"))].into_iter().collect(),
+/// };
+/// let matches = evaluate_dcql(&query, &[holding.clone()])?;
+/// assert!(find_unsatisfied_claim_paths(&matches).is_empty());
+/// # Ok(())
+/// # }
+/// ```
+pub fn find_unsatisfied_claim_paths(matches: &[DcqlMatch]) -> Vec<String> {
+    let mut out = Vec::new();
+    for m in matches {
+        let keys: std::collections::HashSet<String> =
+            m.credential.claim_values.keys().cloned().collect();
+        for path in &m.selected_claim_paths {
+            let mut satisfied = false;
+            for (i, seg) in path.iter().enumerate() {
+                let prefix = path[..=i]
+                    .iter()
+                    .map(|v| match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        serde_json::Value::Number(n) => n.to_string(),
+                        _ => "*".to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("/");
+                match seg {
+                    serde_json::Value::Null => {
+                        satisfied = keys
+                            .iter()
+                            .any(|k| k == &prefix || k.starts_with(&format!("{prefix}/")));
+                        break;
+                    }
+                    _ => {
+                        if keys.contains(&prefix) {
+                            satisfied = true;
+                            break;
+                        }
+                        // The LAST segment decides; intermediate misses
+                        // only end the walk unsatisfied at the end.
+                        if i + 1 == path.len() {
+                            satisfied = false;
+                        }
+                    }
+                }
+            }
+            if !satisfied {
+                let label = path
+                    .iter()
+                    .map(|v| {
+                        v.as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| "<idx>".to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("/");
+                out.push(format!("{}/{}", m.query.id, label));
+            }
+        }
+    }
+    out
+}
+
+/// The §8.5 error response delivery: the form-encoded POST to the
+/// `response_uri` carrying the Authorization Error Response (the
+/// response-side unsatisfiable-query rule - the wallet presents no
+/// vp_token when a required Credential Query/claim cannot be met).
+///
+/// # Errors
+/// Transport failures (the caller renders its own error screen).
+pub async fn post_response_error(
+    http: &reqwest::Client,
+    response_uri: &str,
+    error: &str,
+    description: &str,
+    state: Option<&str>,
+) -> Result<(), String> {
+    let mut form = vec![("error", error)];
+    if !description.is_empty() {
+        form.push(("error_description", description));
+    }
+    if let Some(s) = state {
+        form.push(("state", s));
+    }
+    let resp = http
+        .post(response_uri)
+        .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .form(&form)
+        .send()
+        .await
+        .map_err(|e| format!("error response POST: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("error response POST: HTTP {status} {body}"));
+    }
+    Ok(())
+}
+
+/// The §5.10 `request_uri_method=post` fetch: a form-urlencoded POST
+/// carrying `wallet_metadata` (the wallet's client_metadata) and a
+/// fresh `wallet_nonce` (the verifier folds both back into the
+/// re-signed request object). Returns the (re-signed) request object
+/// JWS body.
+///
+/// # Errors
+/// Transport failures surface as descriptive strings.
+pub async fn fetch_request_uri_post(
+    http: &reqwest::Client,
+    request_uri: &str,
+    wallet_metadata: &serde_json::Value,
+) -> Result<String, String> {
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let form = [
+        ("wallet_nonce", nonce.as_str()),
+        (
+            "wallet_metadata",
+            &serde_json::to_string(wallet_metadata)
+                .map_err(|e| format!("the wallet_metadata serialize: {e}"))?,
+        ),
+    ];
+    let resp = http
+        .post(request_uri)
+        .header(reqwest::header::ACCEPT, "application/oauth-authz-req+jwt")
+        .form(&form)
+        .send()
+        .await
+        .map_err(|e| format!("request_uri POST: {e}"))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("request_uri POST read: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("request_uri POST: HTTP {status} {body}"));
+    }
+    Ok(body)
 }
 
 /// The direct_post delivery (§8.2): the form-encoded POST to the
@@ -1094,5 +1532,140 @@ mod tests {
             binding_audience("x509_san_dns:v.example", Some("https://verifier.example.com/")),
             "origin:https://verifier.example.com/"
         );
+    }
+
+    // ===== The rig's honesty fixes (SKIPFIX-1), as unit coverage. =====
+
+    fn ec_jwk(with_use: bool) -> serde_json::Value {
+        // One EC verifier key (the suite's response-encryption JWK).
+        let mut jwk = serde_json::json!({
+            "kty": "EC", "crv": "P-256",
+            "x": "DANocVJyfLPuyeW5LSgNgTg2ztiHzp9CILq5EKCtE-4",
+            "y": "TgA4SJjZ7Vf_iOtiSNRHLjZO-4d8mdJ5rS1j4Kj_4Xs",
+            "alg": "ECDH-ES",
+        });
+        if with_use {
+            jwk["use"] = serde_json::json!("enc");
+        }
+        jwk
+    }
+
+    fn request_with_jwks(jwks: serde_json::Value) -> AuthorizationRequest {
+        let mut req = parse_request(
+            r#"{"client_id": "redirect_uri:https://v/cb", "response_type": "vp_token",
+                "response_mode": "direct_post.jwt", "response_uri": "https://v/r",
+                "nonce": "n-0S6_WzA2Mj",
+                "dcql_query": {"credentials": []}}"#,
+        )
+        .unwrap();
+        req.client_metadata = serde_json::json!({"jwks": jwks});
+        req
+    }
+
+    #[test]
+    fn thumbprint_covers_the_response_encryption_jwk() {
+        // The RFC 7638 thumbprint of the EC key is the standard hash of
+        // {crv, kty, x, y}.
+        let req = request_with_jwks(serde_json::json!({ "keys": [ec_jwk(true)] }));
+        let tp = response_encryption_thumbprint(&req).unwrap();
+        let raw = tp.expect("the EC JWK is a response-encryption candidate");
+        let canonical = serde_json::json!({
+            "crv": "P-256", "kty": "EC",
+            "x": "DANocVJyfLPuyeW5LSgNgTg2ztiHzp9CILq5EKCtE-4",
+            "y": "TgA4SJjZ7Vf_iOtiSNRHLjZO-4d8mdJ5rS1j4Kj_4Xs",
+        });
+        let expected = sentin8::mdoc::jwk_thumbprint_raw(&canonical).unwrap();
+        assert_eq!(raw.as_slice(), &expected, "the thumbprint is RFC 7638 over the canonical members");
+    }
+
+    #[test]
+    fn thumbprint_accepts_use_less_encryption_jwk() {
+        // THE bw149 desync: the suite's ...WithoutUseEnc row omits `use` -
+        // the JWK stays a response-encryption candidate (OID4VP 8.3: kty
+        // EC + the key-agreement alg) and the handover thumbprint rides.
+        // Requiring use:"enc" dropped it and the holder hashed the
+        // UNENCRYPTED HandoverInfo while the verifier hashed the
+        // ENCRYPTED one.
+        let req = request_with_jwks(serde_json::json!({ "keys": [ec_jwk(false)] }));
+        let tp = response_encryption_thumbprint(&req).unwrap();
+        assert!(
+            tp.is_some(),
+            "a use-less EC/ECDH JWK is still the response-encryption key"
+        );
+        // The symmetric sanity: a use-less NON-EC key is not a candidate.
+        let req2 = request_with_jwks(serde_json::json!({ "keys": [
+            {"kty": "oct", "k": "AAECAw"}
+        ]}));
+        assert!(response_encryption_thumbprint(&req2).unwrap().is_none());
+    }
+
+    #[test]
+    fn dcql_claims_map_to_the_mdoc_allowlist() {
+        // The mdoc_entry wiring: the selected claim paths render the
+        // (namespace, elementIdentifier) allowlist - two paths in, two
+        // allowlist pairs.
+        let query = mdl_query(
+            vec![
+                claims_query("family"),
+                claims_query("given"),
+            ],
+            vec![],
+        );
+        let holdings = [mdl_holding()];
+        let matches = evaluate_dcql(&query, &holdings).unwrap();
+        assert_eq!(matches.len(), 1);
+        let allowlist: Vec<(String, String)> = matches[0]
+            .selected_claim_paths
+            .iter()
+            .filter_map(|path| {
+                let ns = path.first()?.as_str()?;
+                let elem = path.get(1)?.as_str()?;
+                Some((ns.to_string(), elem.to_string()))
+            })
+            .collect();
+        assert_eq!(allowlist.len(), 2);
+        assert!(allowlist.iter().all(|(ns, _)| ns == "org.iso.18013.5.1"));
+        assert!(allowlist.iter().any(|(_, e)| e == "given_name"));
+        assert!(allowlist.iter().any(|(_, e)| e == "family_name"));
+    }
+
+    fn claims_query(id: &str) -> ClaimsQuery {
+        let ns = "org.iso.18013.5.1";
+        let elem = match id {
+            "family" => "family_name",
+            _ => "given_name",
+        };
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "path": [ns, elem],
+            "options": []
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn verifier_info_accepts_array_and_object() {
+        // The spec form (5.1): a non-empty array of attestation objects.
+        let arr = serde_json::json!({
+            "client_id": "x509_hash:abc", "nonce": "n-1",
+            "verifier_info": [{"format": "jwt", "data": "eyJ"}]
+        });
+        let req: AuthorizationRequest = serde_json::from_value(arr).unwrap();
+        assert_eq!(req.verifier_info.len(), 1);
+        // The suite's live form: the client-block member copied
+        // VERBATIM (a bare object) - the 422 regression this fixes.
+        let obj = serde_json::json!({
+            "client_id": "x509_hash:abc", "nonce": "n-1",
+            "verifier_info": {"name": "Sentin8 Verifier", "purpose": ["identity presentation verification"]}
+        });
+        let req: AuthorizationRequest = serde_json::from_value(obj).unwrap();
+        assert_eq!(req.verifier_info.len(), 1);
+        // A malformed member NEVER fails the request (5.11: ignore).
+        let junk = serde_json::json!({
+            "client_id": "x509_hash:abc", "nonce": "n-1",
+            "verifier_info": 42
+        });
+        let req: AuthorizationRequest = serde_json::from_value(junk).unwrap();
+        assert!(req.verifier_info.is_empty());
     }
 }

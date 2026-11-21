@@ -39,3 +39,9 @@ flate2 = "1"
 wallet8-oid4vci-client = { path = "crates/oid4vci-client" }
 wallet8-oid4vp-client = { path = "crates/oid4vp-client" }
 wallet8-holder-contracts = { path = "crates/holder-contracts" }
+
+# The dev-tree override: the local platform SDK workspace patches the
+# published pin (the mdoc claim filter rides here before the next sdk
+# tag; the release flow re-tags + drops this section).
+[patch."https://github.com/Sentin8/sentin8-sdk"]
+sentin8 = { path = "/home/hamid/dev/sentin8.new/sentin8/sentin8-sdk/facade" }

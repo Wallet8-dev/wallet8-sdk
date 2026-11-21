@@ -105,11 +105,11 @@ pub fn decode_status_reference(sd_jwt_payload: &Value) -> Result<Option<StatusRe
     let idx = reference
         .get("idx")
         .and_then(|v| v.as_u64())
-        .ok_or("the status_list carries no idx (TSL §6.2)")?;
+        .ok_or("the status_list carries no idx")?;
     let uri = reference
         .get("uri")
         .and_then(|v| v.as_str())
-        .ok_or("the status_list carries no uri (TSL §6.2)")?
+        .ok_or("the status_list carries no uri")?
         .to_string();
     Ok(Some(StatusReference { idx, uri }))
 }
@@ -151,14 +151,14 @@ pub fn parse_status_list_token(jwt: &str) -> Result<StatusList, String> {
     let bits = claims
         .pointer("/status_list/bits")
         .and_then(|v| v.as_u64())
-        .ok_or("the status_list carries no bits (TSL §5.1)")? as u32;
+        .ok_or("the status_list carries no bits")? as u32;
     if ![1, 2, 4, 8].contains(&bits) {
-        return Err(format!("the bits value {bits} is outside 1/2/4/8 (TSL §4.1)"));
+        return Err(format!("the bits value {bits} is outside 1/2/4/8"));
     }
     let lst = claims
         .pointer("/status_list/lst")
         .and_then(|v| v.as_str())
-        .ok_or("the status_list carries no lst (TSL §5.1)")?;
+        .ok_or("the status_list carries no lst")?;
     let entries = inflate_status_list(lst)?;
     Ok(StatusList {
         bits,
@@ -242,7 +242,7 @@ pub async fn fetch_status_list(
     if let (Some(sub), false) = (list.uri.as_deref(), sub_matches(list.uri.as_deref(), uri)) {
         let _ = sub;
         return Err(format!(
-            "the status list token's sub does not match the requested uri (TSL §8.3.4a)"
+            "the status list token's sub does not match the requested uri"
         ));
     }
     Ok(list)

@@ -114,13 +114,22 @@ fn verify_es256_typ(
         )));
     }
     // The typ check when the caller demands one (RFC 9101 §2 for the
-    // request object; the attestation's own typ rides §12).
+    // request object; the attestation's own typ rides §12). A DEMANDED
+    // typ MUST BE PRESENT (the missing typ is the §2 violation the
+    // wallet must refuse, not tolerate).
     if let Some(expected) = expected_typ {
-        if let Some(typ) = header_json.get("typ").and_then(|v| v.as_str()) {
-            if typ != expected {
+        let typ = header_json.get("typ").and_then(|v| v.as_str());
+        match typ {
+            Some(t) if t == expected => {}
+            Some(t) => {
                 return Err(VerificationError::invalid_request(format!(
-                    "the request object's typ is {typ:?} - the JAR type is required (RFC 9101 §2)"
+                    "the request object's typ is {t:?} - the JAR type is required"
                 )));
+            }
+            None => {
+                return Err(VerificationError::invalid_request(
+                    "the request object carries no typ header - the JAR type is required",
+                ));
             }
         }
     }
@@ -172,7 +181,7 @@ pub fn x5c_leaf_der(header: &Value) -> Result<Vec<u8>, VerificationError> {
         .and_then(|v| v.as_array())
         .filter(|c| !c.is_empty())
         .ok_or_else(|| VerificationError::invalid_request(
-            "the request object carries no x5c certificate chain (§5.9.3)",
+            "the request object carries no x5c certificate chain",
         ))?;
     let leaf = chain
         .first()
@@ -255,14 +264,206 @@ fn split_prefix(client_id: &str) -> (Option<&str>, &str) {
         match prefix {
             "x509_san_dns" | "x509_hash" | "verifier_attestation" | "redirect_uri"
             | "openid_federation" | "decentralized_identifier" => (Some(prefix), rest),
-            _ => (None, client_id),
+            // The WEB-ORIGIN prefix (5.9.4): the client_id IS the
+            // request origin URI (the dc_api form's 'https://...' -
+            // the identifier carries the FULL id).
+            "https" | "http" => (Some("web-origin"), client_id),
+            // Any OTHER colon-form scheme is an unknown prefix the
+            // wallet MUST refuse (5.9: only the enumerated Client
+            // Identifier Prefixes are valid) - never fall through to
+            // the pre-registered arm (the invalid-prefix negative
+            // rides exactly this shape).
+            _ => (Some(prefix), rest),
         }
     } else {
         (None, client_id)
     }
 }
 
-/// Verify a signed request object + apply the per-prefix rules.
+/// Verify a PLAIN (unsigned) request object per the per-prefix key
+/// rules (6.1: the dc_api unsigned form carries the claims in the
+/// clear - the web-origin prefix accepts it; any SIGNED-prefix form
+/// must present a JWS instead).
+///
+/// # Errors
+/// Descriptive verification failures (the caller renders the error).
+pub fn verify_request_object_value(
+    claims: &serde_json::Value,
+    origin: Option<&str>,
+) -> Verified<crate::AuthorizationRequest> {
+    let mut claims = claims.clone();
+    // The MULTISIGNED form (request_uri_multisigned): the JSON object
+    // carries 'payload' (the b64url claims) + 'signatures' (each with
+    // its own header/protected). Verify every signature against its
+    // embedded key (the x509_hash/x5c-hash rule per signature), then
+    // parse the payload's claims.
+    if claims.get("payload").is_some() && claims.get("signatures").is_some() {
+        use base64::Engine as _;
+        let payload_b64 = claims
+            .get("payload")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| VerificationError::invalid_request("the multisigned form carries no payload"))?;
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload_b64)
+            .map_err(|e| VerificationError::invalid_request(format!("the multisigned payload decode: {e}")))?;
+        let payload: serde_json::Value = serde_json::from_slice(&raw)
+            .map_err(|e| VerificationError::invalid_request(format!("the multisigned payload parse: {e}")))?;
+        let sigs = claims
+            .get("signatures")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if sigs.is_empty() {
+            return Err(VerificationError::invalid_request(
+                "the multisigned form carries no signatures (REQUEST_URI_MULTISIGNED)",
+            ));
+        }
+        // RFC 7515 section 5.2: when a JWS accepts multiple signature
+        // objects, the recipient MAY consider it valid if ANY of the
+        // signatures verifies. The suite module
+        // multisigned-one-invalid-signature drives exactly this: one of
+        // the two signatures is corrupted, the other stays valid - the
+        // wallet MUST proceed on the valid one. Each signature is
+        // checked; ANY success clears the request. Per-signature key
+        // identity (x509_hash) stays fail-closed inside its own arm: a
+        // single failed attempt does not taint the others.
+        let mut any_valid = false;
+        let mut last_err: Option<String> = None;
+        for sig in &sigs {
+            let sigv = match sig.get("signature").and_then(|v| v.as_str()) {
+                Some(s) => s,
+                None => {
+                    last_err = Some(
+                        "the multisigned signature entry carries no signature".into(),
+                    );
+                    continue;
+                }
+            };
+            let owned_prot: String = if let Some(prot) =
+                sig.get("protected").and_then(|v| v.as_str())
+            {
+                prot.to_string()
+            } else if let Some(hdr) = sig.get("header") {
+                // The flat header form: re-serialize compact.
+                let hdr_json = serde_json::to_string(hdr).map_err(|e| {
+                    VerificationError::invalid_request(format!(
+                        "the signature header serialize: {e}"
+                    ))
+                })?;
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(hdr_json.as_bytes())
+            } else {
+                last_err = Some(
+                    "the multisigned signature entry carries no protected/header".into(),
+                );
+                continue;
+            };
+            let (prot_b64, sig_b64): (&str, &str) = (owned_prot.as_str(), sigv);
+            let hdr_json: serde_json::Value = {
+                let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(prot_b64)
+                    .map_err(|e| {
+                        VerificationError::invalid_request(format!(
+                            "the signature header decode: {e}"
+                        ))
+                    })?;
+                serde_json::from_slice(&raw).map_err(|e| {
+                    VerificationError::invalid_request(format!(
+                        "the signature header parse: {e}"
+                    ))
+                })?
+            };
+            let jws = format!("{prot_b64}.{payload_b64}.{sig_b64}");
+            // The per-signature verification: x509_hash (x5c-hash) and
+            // the generic x5c arms. A verify failure on one signature
+            // records the reason and moves on - it does not abort.
+            let prefix: &str = hdr_json
+                .get("client_id")
+                .and_then(|c| c.as_str())
+                .map(split_prefix)
+                .map(|(p, _)| p)
+                .flatten()
+                .unwrap_or("x509_hash");
+            let attempt = (|| -> Result<(), VerificationError> {
+                match prefix {
+                    "x509_hash" | "x509_san_dns" | "web-origin" => {
+                        let leaf = x5c_leaf_der(&hdr_json)?;
+                        let want = x509_hash_value(&leaf);
+                        let identifier = hdr_json
+                            .get("client_id")
+                            .and_then(|v| v.as_str())
+                            .map(|c| split_prefix(c).1)
+                            .unwrap_or_default();
+                        if want != identifier {
+                            return Err(VerificationError::invalid_request(
+                                "the multisigned signature's client_id hash does not match the leaf (section 5.9.3)",
+                            ));
+                        }
+                        verify_es256(&jws, &x5c_leaf_jwk(&leaf)?)?;
+                    }
+                    other => {
+                        // section 5.9.2: an unrecognized client_id
+                        // prefix scheme in a SIGNED request is
+                        // untrusted - the wallet refuses (it cannot
+                        // resolve the verifier identity; the
+                        // negative-test-invalid-client-id-prefix row
+                        // drives exactly this). The x5c/jwk fallback
+                        // applies ONLY to a signature header with NO
+                        // client_id at all.
+                        let _ = other;
+                        let has_client_id = hdr_json
+                            .get("client_id")
+                            .map(|v| v.is_string())
+                            .unwrap_or(false);
+                        if has_client_id {
+                            return Err(VerificationError::invalid_request(
+                                "the multisigned signature carries an unrecognized client_id prefix scheme (section 5.9.2)",
+                            ));
+                        }
+                        if let Ok(leaf) = x5c_leaf_der(&hdr_json) {
+                            verify_es256(&jws, &x5c_leaf_jwk(&leaf)?)?;
+                        } else if let Some(jwk) = hdr_json.get("jwk").cloned() {
+                            verify_es256(&jws, &jwk)?;
+                        } else {
+                            return Err(VerificationError::invalid_request(
+                                "the multisigned signature carries no verifiable key",
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            })();
+            match attempt {
+                Ok(()) => any_valid = true,
+                Err(e) => last_err = Some(e.description),
+            }
+        }
+        if !any_valid {
+            return Err(VerificationError::invalid_request(last_err.unwrap_or_else(
+                || "the multisigned form carries no verifiable signature".into(),
+            )));
+        }
+        // The claims = the payload (the client_id derivation follows).
+        claims = payload;
+    }
+    // 5.9.4/6.3 (the DC API form): the Client Identifier = the
+    // verifier's ORIGIN - the request body MAY omit it (the origin is
+    // the browser-established context); the wallet derives it from the
+    // invocation origin.
+    if claims.get("client_id").and_then(|v| v.as_str()).is_none() {
+        let origin = origin.ok_or_else(|| {
+            VerificationError::invalid_request(
+                "the dc_api request carries no client_id and no origin context (5.9.4)",
+            )
+        })?;
+        claims["client_id"] = serde_json::json!(origin);
+    }
+    // The web-origin derived form is the accepted prefix here.
+    serde_json::from_value::<crate::AuthorizationRequest>(claims)
+        .map_err(|e| VerificationError::invalid_request(format!("the request parse: {e}")))
+}
+
+/// Verify a signed request object + apply the per-prefix rules./// Verify a signed request object + apply the per-prefix rules.
 ///
 /// The signature check ALWAYS precedes the payload use (§15.8) - a
 /// bad signature never reaches the shape gate, the DCQL, or the
@@ -286,7 +487,7 @@ pub fn verify_request_object(
     let client_id = claims
         .get("client_id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| VerificationError::invalid_request("the request object carries no client_id (§5.2)"))?
+        .ok_or_else(|| VerificationError::invalid_request("the request object carries no client_id"))?
         .to_string();
     let (prefix, identifier) = split_prefix(&client_id);
     match prefix {
@@ -299,7 +500,7 @@ pub fn verify_request_object(
             let names = x5c_leaf_dns_names(&leaf)?;
             if !names.iter().any(|n| n == identifier) {
                 return Err(VerificationError::invalid_request(format!(
-                    "the client_id's DNS name {identifier:?} matches no SAN of the leaf certificate (§5.9.3)"
+                    "the client_id's DNS name {identifier:?} matches no SAN of the leaf certificate"
                 )));
             }
         }
@@ -311,11 +512,33 @@ pub fn verify_request_object(
             let want = x509_hash_value(&leaf);
             if want != identifier {
                 return Err(VerificationError::invalid_request(
-                    "the client_id's hash does not match the leaf certificate (§5.9.3)",
+                    "the client_id's hash does not match the leaf certificate",
                 ));
             }
         }
-        // §12: the attestation's sub = the identifier; the request
+        // 5.9.4 (the dc_api form): the client_id IS the origin URI -
+        // the verifier's origin is the trusted context (App. A.2 does
+        // the origin check later); the request object MAY be UNSIGNED
+        // (6.1: the dc_api signed form carries request_uri_signed
+        // semantics only when signed). Verify the ES256 signature when
+        // the object carries the x5c/jwk key (the signed variant),
+        // accept the unsigned null-alg form otherwise (6.1).
+        Some("web-origin") => {
+            let alg = header_json.get("alg").and_then(|v| v.as_str()).unwrap_or("");
+            if alg == "ES256" {
+                if let Ok(leaf) = x5c_leaf_der(&header_json) {
+                    verify_es256(jws, &x5c_leaf_jwk(&leaf)?)?;
+                } else if let Some(jwk) = header_json.get("jwk").cloned() {
+                    verify_es256(jws, &jwk)?;
+                } else {
+                    return Err(VerificationError::invalid_client(format!(
+                        "the signed web-origin request carries no key (5.9.4)"
+                    )));
+                }
+            }
+            // null/unsigned: accepted (the DC API unsigned form).
+        }
+        // 12: the attestation's sub = the identifier; the request        // §12: the attestation's sub = the identifier; the request
         // signs with the cnf.jwk key; the attestation's iss is
         // trusted; redirect_uris (when present) contains the
         // request's redirect_uri.
@@ -324,7 +547,7 @@ pub fn verify_request_object(
                 .get("jwt")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| VerificationError::invalid_request(
-                    "the verifier_attestation prefix demands the attestation JWT in the request header (§12)",
+                    "the verifier_attestation prefix demands the attestation JWT in the request header",
                 ))?;
             let att_header: Value = {
                 let seg = attestation.split('.').next().unwrap_or_default();
@@ -334,7 +557,7 @@ pub fn verify_request_object(
             let att_alg = att_header.get("alg").and_then(|v| v.as_str()).unwrap_or("");
             if att_alg != "ES256" {
                 return Err(VerificationError::invalid_request(format!(
-                    "the attestation's alg is {att_alg:?} - only ES256 (§12)"
+                    "the attestation's alg is {att_alg:?} - only ES256"
                 )));
             }
             let att_payload = jws_payload(attestation)?;
@@ -342,7 +565,7 @@ pub fn verify_request_object(
                 .map_err(|e| VerificationError::invalid_request(format!("attestation claims: {e}")))?;
             if att_claims.get("sub").and_then(|v| v.as_str()) != Some(identifier) {
                 return Err(VerificationError::invalid_client(
-                    "the attestation's sub does not match the client identifier (§12)",
+                    "the attestation's sub does not match the client identifier",
                 ));
             }
             let issuer = att_claims.get("iss").and_then(|v| v.as_str()).unwrap_or("");
@@ -352,7 +575,7 @@ pub fn verify_request_object(
                 .find(|(iss, _)| iss == issuer)
             else {
                 return Err(VerificationError::invalid_client(format!(
-                    "the attestation's issuer {issuer:?} is not among the trusted attesters (§12)"
+                    "the attestation's issuer {issuer:?} is not among the trusted attesters"
                 )));
             };
             verify_es256_any_typ(attestation, issuer_jwk)?;
@@ -360,7 +583,7 @@ pub fn verify_request_object(
                 .pointer("/cnf/jwk")
                 .cloned()
                 .ok_or_else(|| VerificationError::invalid_client(
-                    "the attestation carries no cnf.jwk key (§12)",
+                    "the attestation carries no cnf.jwk key",
                 ))?;
             verify_es256(jws, &cnf)?;
             // The redirect_uri binding (§12's redirect_uris claim).
@@ -371,7 +594,7 @@ pub fn verify_request_object(
                 let ok = allowed.iter().filter_map(|r| r.as_str()).any(|r| r == redirect);
                 if !ok {
                     return Err(VerificationError::invalid_client(
-                        "the redirect_uri is not among the attestation's redirect_uris (§12)",
+                        "the redirect_uri is not among the attestation's redirect_uris",
                     ));
                 }
             }
@@ -389,7 +612,7 @@ pub fn verify_request_object(
                 .unwrap_or("");
             if uri != identifier {
                 return Err(VerificationError::invalid_request(
-                    "the redirect_uri client_id does not match the request's redirect_uri (§5.9.3)",
+                    "the redirect_uri client_id does not match the request's redirect_uri",
                 ));
             }
         }
@@ -416,7 +639,7 @@ pub fn verify_request_object(
                 }
             } else {
                 return Err(VerificationError::invalid_request(
-                    "the openid_federation prefix requires the trust_chain header (§5.9.3)",
+                    "the openid_federation prefix requires the trust_chain header",
                 ));
             }
         }
@@ -430,7 +653,7 @@ pub fn verify_request_object(
                 .cloned()
                 .or_else(|| header_json.get("jwks").and_then(|j| j.pointer("/keys/0").cloned()))
                 .ok_or_else(|| VerificationError::invalid_request(
-                    "the DID prefix requires the verification key in the request header (§5.9.3)",
+                    "the DID prefix requires the verification key in the request header",
                 ))?;
             verify_es256(jws, &jwk)?;
         }
@@ -446,7 +669,7 @@ pub fn verify_request_object(
                 verify_es256(jws, &x5c_leaf_jwk(&leaf)?)?;
             } else {
                 return Err(VerificationError::invalid_client(format!(
-                    "the pre-registered client {identifier:?} carries no verifiable key (§5.9.2)"
+                    "the pre-registered client {identifier:?} carries no verifiable key"
                 )));
             }
         }
@@ -455,7 +678,7 @@ pub fn verify_request_object(
         // arm keeps the match exhaustive (§5.9.2's refuse path).
         Some(other) => {
             return Err(VerificationError::invalid_client(format!(
-                "the Client Identifier Prefix {other:?} is not supported (§5.9.2)"
+                "the Client Identifier Prefix {other:?} is not supported"
             )));
         }
     }
